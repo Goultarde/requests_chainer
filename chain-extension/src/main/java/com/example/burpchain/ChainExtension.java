@@ -6,6 +6,10 @@ import burp.api.montoya.core.Range;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.http.handler.HttpHandler;
+import burp.api.montoya.http.handler.HttpRequestToBeSent;
+import burp.api.montoya.http.handler.RequestToBeSentAction;
+import burp.api.montoya.http.handler.ResponseReceivedAction;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
@@ -45,6 +49,7 @@ import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
+import javax.swing.JFileChooser;
 import javax.swing.JSplitPane;
 import javax.swing.JTable;
 import javax.swing.SwingUtilities;
@@ -54,6 +59,9 @@ import javax.swing.table.AbstractTableModel;
 public final class ChainExtension implements BurpExtension {
     private MontoyaApi api;
     private Component suiteTab;
+    private volatile boolean intruderChainEnabled;
+    private volatile String intruderTargetUrl;
+    private volatile int intruderTargetIndex;
     private final List<ChainStep> steps = new ArrayList<>();
     private final StepTable model = new StepTable();
     private final JTable table = new JTable(model);
@@ -73,40 +81,55 @@ public final class ChainExtension implements BurpExtension {
         suiteTab = buildPanel();
         api.userInterface().registerSuiteTab("Requests Chainer", suiteTab);
         api.userInterface().registerContextMenuItemsProvider(new Menu());
+        api.http().registerHttpHandler(new IntruderChainHandler());
     }
 
     private Component buildPanel() {
         JPanel root = new JPanel(new BorderLayout(6, 6));
         root.setMinimumSize(new java.awt.Dimension(900, 600));
         root.setPreferredSize(new java.awt.Dimension(1200, 800));
-        JPanel buttons = new JPanel(new java.awt.GridLayout(2, 4, 5, 5));
+        JPanel buttons = new JPanel(new WrapLayout(FlowLayout.LEFT, 5, 2));
         JButton up = new JButton("Move up");
         JButton down = new JButton("Move down");
         JButton remove = new JButton("Remove");
         JButton save = new JButton("Save request edit");
-        JButton variable = new JButton("From response selection");
-        JButton insert = new JButton("Insert/replace variable");
+        JButton variable = new JButton("Variable from response selection");
+        JButton insert = new JButton("Insert variable");
+        JButton intruder = new JButton("Send target to Intruder");
+        variable.setBackground(new Color(0x2F75B5));
+        variable.setForeground(Color.WHITE);
+        variable.setOpaque(true);
+        variable.setBorderPainted(false);
         JButton run = new JButton("Run chain");
         run.setToolTipText("Execute the requests in the table in order");
         JButton clear = new JButton("Clear chain");
-        buttons.add(run); buttons.add(clear);
-        buttons.add(up); buttons.add(down); buttons.add(remove); buttons.add(save);
-        buttons.add(variable); buttons.add(insert);
+        buttons.add(run); buttons.add(clear); buttons.add(up); buttons.add(down); buttons.add(remove);
+        buttons.add(save); buttons.add(variable); buttons.add(insert); buttons.add(intruder);
         run.setBackground(new Color(0xE8752A));
         run.setForeground(Color.WHITE);
         run.setOpaque(true);
         run.setBorderPainted(false);
         JPanel variableBar = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        variableBar.add(new JLabel("Variables:"));
+        variableBar.add(new JLabel("Select the variable to insert:"));
         variableBar.add(variableSearch);
         variableBar.add(variableBox);
-        variableBar.add(new JLabel("Select a request value to replace, or place the caret"));
+        variableBar.add(new JLabel("Select the number of chain runs:"));
         variableBar.add(new JLabel("Runs:"));
         repetitionCount.setToolTipText("Number of complete chain executions (1-1000)");
         variableBar.add(repetitionCount);
-        JPanel top = new JPanel(new BorderLayout());
-        top.add(buttons, BorderLayout.NORTH);
-        top.add(variableBar, BorderLayout.SOUTH);
+        JPanel top = new JPanel();
+        top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
+        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
+        variableBar.setAlignmentX(Component.LEFT_ALIGNMENT);
+        top.add(buttons);
+        top.add(variableBar);
+        root.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override public void componentResized(java.awt.event.ComponentEvent e) {
+                buttons.revalidate();
+                top.revalidate();
+                root.revalidate();
+            }
+        });
         root.add(top, BorderLayout.NORTH);
         requestEditor = api.userInterface().createHttpRequestEditor();
         responseEditor = api.userInterface().createHttpResponseEditor();
@@ -120,8 +143,10 @@ public final class ChainExtension implements BurpExtension {
         JPanel bottom = new JPanel(new BorderLayout());
         bottom.add(status, BorderLayout.NORTH);
         bottom.add(new JScrollPane(log), BorderLayout.CENTER);
-        root.add(main, BorderLayout.CENTER);
-        root.add(bottom, BorderLayout.SOUTH);
+        JSplitPane content = new JSplitPane(JSplitPane.VERTICAL_SPLIT, main, bottom);
+        content.setResizeWeight(0.82);
+        content.setOneTouchExpandable(true);
+        root.add(content, BorderLayout.CENTER);
         root.setFocusable(true);
         root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control R"), "requests-chainer-run");
         root.getActionMap().put("requests-chainer-run", new AbstractAction() {
@@ -134,6 +159,7 @@ public final class ChainExtension implements BurpExtension {
         save.addActionListener(e -> saveSelected());
         variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor)));
         insert.addActionListener(e -> insertVariable());
+        intruder.addActionListener(e -> sendTargetToIntruder());
         run.addActionListener(e -> runChain());
         clear.addActionListener(e -> { steps.clear(); model.fireTableDataChanged(); showSelected(); log.setText(""); status.setText("Chain cleared. Add requests from Proxy history."); });
         variableSearch.getDocument().addDocumentListener(new DocumentListener() {
@@ -402,9 +428,11 @@ public final class ChainExtension implements BurpExtension {
         model.fireTableDataChanged(); table.setRowSelectionInterval(target, target);
     }
     private void removeSelected() {
-        int index = table.getSelectedRow(); if (index < 0) return;
-        steps.remove(index); model.fireTableDataChanged();
-        if (!steps.isEmpty()) table.setRowSelectionInterval(Math.min(index, steps.size() - 1), Math.min(index, steps.size() - 1));
+        int[] selected = table.getSelectedRows();
+        if (selected.length == 0) return;
+        for (int i = selected.length - 1; i >= 0; i--) steps.remove(selected[i]);
+        model.fireTableDataChanged();
+        if (!steps.isEmpty()) table.setRowSelectionInterval(Math.min(selected[0], steps.size() - 1), Math.min(selected[0], steps.size() - 1));
         else showSelected();
     }
 
@@ -459,7 +487,124 @@ public final class ChainExtension implements BurpExtension {
         }.execute();
     }
 
+    private void runWithWordlist() {
+        if (running) { error("A chain is already running"); return; }
+        int target = table.getSelectedRow();
+        if (target < 0 || target >= steps.size()) { error("Select the chain request that will receive the wordlist"); return; }
+        JFileChooser chooser = new JFileChooser();
+        if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        try {
+            List<String> payloads = java.nio.file.Files.readAllLines(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8)
+                    .stream().filter(line -> !line.isEmpty()).toList();
+            if (payloads.isEmpty()) { error("The wordlist is empty"); return; }
+            saveSelected();
+            List<ChainStep> snapshot = List.copyOf(steps);
+            running = true;
+            log.append("Starting wordlist run: " + payloads.size() + " payload(s), target step " + (target + 1) + "\n");
+            new SwingWorker<Void, String>() {
+                @Override protected Void doInBackground() throws Exception {
+                    for (int n = 0; n < payloads.size(); n++) {
+                        String payload = payloads.get(n);
+                        List<ChainEngine.Step> definitions = new ArrayList<>();
+                        for (int i = 0; i < snapshot.size(); i++) {
+                            String template = snapshot.get(i).requestTemplate;
+                            if (i == target) template = injectWordlist(template, payload);
+                            definitions.add(new ChainEngine.Step(template, Map.copyOf(snapshot.get(i).outputs)));
+                        }
+                        final int runNumber = n + 1;
+                        ChainEngine.run(definitions, (index, raw) -> {
+                            ChainStep step = snapshot.get(index);
+                            HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
+                            if (!result.hasResponse()) return null;
+                            step.lastResponse = result.response().toString();
+                            step.lastResponseBody = result.response().bodyToString();
+                            return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
+                        }, message -> publish("Payload " + runNumber + ": " + message));
+                    }
+                    return null;
+                }
+                @Override protected void process(List<String> messages) { for (String message : messages) log.append(message + "\n"); }
+                @Override protected void done() { running = false; try { get(); status.setText("Wordlist run finished."); } catch (Exception ex) { status.setText("Wordlist run stopped: " + ex.getCause()); } }
+            }.execute();
+        } catch (Exception ex) { error("Cannot read wordlist: " + ex.getMessage()); }
+    }
+
+    private void sendTargetToIntruder() {
+        ChainStep step = selectedStep();
+        if (step == null) { error("Select the target request first"); return; }
+        saveSelected();
+        try {
+            intruderTargetUrl = step.url;
+            intruderTargetIndex = steps.indexOf(step);
+            intruderChainEnabled = intruderTargetIndex > 0;
+            api.intruder().sendToIntruder(HttpRequest.httpRequest(step.service, step.requestTemplate), "Requests Chainer");
+            status.setText("Target sent to Intruder. The " + intruderTargetIndex + " preceding chain step(s) run before each Intruder request.");
+        } catch (Exception ex) { error("Cannot send request to Intruder: " + ex.getMessage()); }
+    }
+
+    private final class IntruderChainHandler implements HttpHandler {
+        @Override public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent request) {
+            if (!intruderChainEnabled || !request.toolSource().isFromTool(ToolType.INTRUDER)
+                    || intruderTargetUrl == null || !intruderTargetUrl.equals(request.url()))
+                return RequestToBeSentAction.continueWith(request);
+            try {
+                List<ChainStep> before = List.copyOf(steps.subList(0, intruderTargetIndex));
+                List<ChainEngine.Step> definitions = before.stream()
+                        .map(step -> new ChainEngine.Step(step.requestTemplate, Map.copyOf(step.outputs))).toList();
+                Map<String, String> variables = ChainEngine.run(definitions, (index, raw) -> {
+                    ChainStep step = before.get(index);
+                    HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
+                    if (!result.hasResponse()) return null;
+                    step.lastResponse = result.response().toString();
+                    step.lastResponseBody = result.response().bodyToString();
+                    return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
+                }, message -> log.append("Intruder chain: " + message + "\n"));
+                return RequestToBeSentAction.continueWith(HttpRequest.httpRequest(request.httpService(),
+                        Template.renderHttpRequest(request.toString(), variables)));
+            } catch (Exception ex) {
+                api.logging().logToError("Intruder chain failed: " + ex.getMessage());
+                return RequestToBeSentAction.continueWith(request);
+            }
+        }
+        @Override public ResponseReceivedAction handleHttpResponseReceived(burp.api.montoya.http.handler.HttpResponseReceived response) {
+            return ResponseReceivedAction.continueWith(response);
+        }
+    }
+
+    private String injectWordlist(String request, String payload) {
+        if (request.contains("{{WORDLIST}}")) return request.replace("{{WORDLIST}}", payload);
+        int start = request.indexOf('§');
+        int end = start < 0 ? -1 : request.indexOf('§', start + 1);
+        if (start >= 0 && end > start) return request.substring(0, start) + payload + request.substring(end + 1);
+        throw new IllegalArgumentException("Mark the target value with {{WORDLIST}} or §value§");
+    }
+
     private void error(String message) { JOptionPane.showMessageDialog(null, message, "Requests Chainer", JOptionPane.ERROR_MESSAGE); }
+
+    /** FlowLayout whose preferred height follows the available width instead of clipping buttons. */
+    private static final class WrapLayout extends FlowLayout {
+        WrapLayout(int align, int hgap, int vgap) { super(align, hgap, vgap); }
+        @Override public java.awt.Dimension preferredLayoutSize(java.awt.Container target) {
+            synchronized (target.getTreeLock()) {
+                int width = target.getWidth();
+                if (width <= 0) width = 900;
+                java.awt.Insets insets = target.getInsets();
+                int max = width - insets.left - insets.right - getHgap() * 2;
+                int rowWidth = 0, rowHeight = 0, totalHeight = getVgap();
+                for (Component component : target.getComponents()) {
+                    if (!component.isVisible()) continue;
+                    java.awt.Dimension size = component.getPreferredSize();
+                    if (rowWidth > 0 && rowWidth + getHgap() + size.width > max) {
+                        totalHeight += rowHeight + getVgap(); rowWidth = 0; rowHeight = 0;
+                    }
+                    rowWidth += (rowWidth == 0 ? 0 : getHgap()) + size.width;
+                    rowHeight = Math.max(rowHeight, size.height);
+                }
+                totalHeight += rowHeight + getVgap();
+                return new java.awt.Dimension(width, totalHeight + insets.top + insets.bottom);
+            }
+        }
+    }
 
     private final class StepTable extends AbstractTableModel {
         @Override public int getRowCount() { return steps.size(); }
