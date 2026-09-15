@@ -1,0 +1,473 @@
+package com.example.burpchain;
+
+import burp.api.montoya.BurpExtension;
+import burp.api.montoya.MontoyaApi;
+import burp.api.montoya.core.Range;
+import burp.api.montoya.core.ToolType;
+import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
+import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
+import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
+import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
+import burp.api.montoya.ui.editor.HttpRequestEditor;
+import burp.api.montoya.ui.editor.HttpResponseEditor;
+import java.awt.BorderLayout;
+import java.awt.Component;
+import java.awt.FlowLayout;
+import java.awt.Color;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.nio.charset.StandardCharsets;
+import javax.swing.JButton;
+import javax.swing.AbstractAction;
+import javax.swing.JComponent;
+import javax.swing.KeyStroke;
+import javax.swing.JComboBox;
+import javax.swing.JTextField;
+import javax.swing.JCheckBox;
+import javax.swing.JRadioButton;
+import javax.swing.ButtonGroup;
+import javax.swing.JTextArea;
+import javax.swing.JTextPane;
+import javax.swing.text.Style;
+import javax.swing.text.StyleConstants;
+import javax.swing.text.StyledDocument;
+import javax.swing.BorderFactory;
+import javax.swing.JDialog;
+import javax.swing.JSpinner;
+import javax.swing.SpinnerNumberModel;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import javax.swing.JLabel;
+import javax.swing.JMenuItem;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.JSplitPane;
+import javax.swing.JTable;
+import javax.swing.SwingUtilities;
+import javax.swing.SwingWorker;
+import javax.swing.table.AbstractTableModel;
+
+public final class ChainExtension implements BurpExtension {
+    private MontoyaApi api;
+    private Component suiteTab;
+    private final List<ChainStep> steps = new ArrayList<>();
+    private final StepTable model = new StepTable();
+    private final JTable table = new JTable(model);
+    private HttpRequestEditor requestEditor;
+    private HttpResponseEditor responseEditor;
+    private final javax.swing.JTextArea log = new javax.swing.JTextArea(5, 80);
+    private final JLabel status = new JLabel("Select requests in Proxy history, then right-click > Add to Requests Chainer.");
+    private volatile boolean running;
+    private ChainStep displayedStep;
+    private final JComboBox<String> variableBox = new JComboBox<>();
+    private final JTextField variableSearch = new JTextField(12);
+    private final JSpinner repetitionCount = new JSpinner(new SpinnerNumberModel(1, 1, 1000, 1));
+
+    @Override public void initialize(MontoyaApi api) {
+        this.api = api;
+        api.extension().setName("Requests Chainer");
+        suiteTab = buildPanel();
+        api.userInterface().registerSuiteTab("Requests Chainer", suiteTab);
+        api.userInterface().registerContextMenuItemsProvider(new Menu());
+    }
+
+    private Component buildPanel() {
+        JPanel root = new JPanel(new BorderLayout(6, 6));
+        root.setMinimumSize(new java.awt.Dimension(900, 600));
+        root.setPreferredSize(new java.awt.Dimension(1200, 800));
+        JPanel buttons = new JPanel(new java.awt.GridLayout(2, 4, 5, 5));
+        JButton up = new JButton("Move up");
+        JButton down = new JButton("Move down");
+        JButton remove = new JButton("Remove");
+        JButton save = new JButton("Save request edit");
+        JButton variable = new JButton("From response selection");
+        JButton insert = new JButton("Insert/replace variable");
+        JButton run = new JButton("Run chain");
+        run.setToolTipText("Execute the requests in the table in order");
+        JButton clear = new JButton("Clear chain");
+        buttons.add(run); buttons.add(clear);
+        buttons.add(up); buttons.add(down); buttons.add(remove); buttons.add(save);
+        buttons.add(variable); buttons.add(insert);
+        run.setBackground(new Color(0xE8752A));
+        run.setForeground(Color.WHITE);
+        run.setOpaque(true);
+        run.setBorderPainted(false);
+        JPanel variableBar = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        variableBar.add(new JLabel("Variables:"));
+        variableBar.add(variableSearch);
+        variableBar.add(variableBox);
+        variableBar.add(new JLabel("Select a request value to replace, or place the caret"));
+        variableBar.add(new JLabel("Runs:"));
+        repetitionCount.setToolTipText("Number of complete chain executions (1-1000)");
+        variableBar.add(repetitionCount);
+        JPanel top = new JPanel(new BorderLayout());
+        top.add(buttons, BorderLayout.NORTH);
+        top.add(variableBar, BorderLayout.SOUTH);
+        root.add(top, BorderLayout.NORTH);
+        requestEditor = api.userInterface().createHttpRequestEditor();
+        responseEditor = api.userInterface().createHttpResponseEditor();
+        log.setEditable(false);
+        // Montoya's native editors provide their own scrolling and syntax coloring.
+        JSplitPane editors = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
+                requestEditor.uiComponent(), responseEditor.uiComponent());
+        editors.setResizeWeight(0.5);
+        JSplitPane main = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(table), editors);
+        main.setResizeWeight(0.25);
+        JPanel bottom = new JPanel(new BorderLayout());
+        bottom.add(status, BorderLayout.NORTH);
+        bottom.add(new JScrollPane(log), BorderLayout.CENTER);
+        root.add(main, BorderLayout.CENTER);
+        root.add(bottom, BorderLayout.SOUTH);
+        root.setFocusable(true);
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control R"), "requests-chainer-run");
+        root.getActionMap().put("requests-chainer-run", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { runChain(); }
+        });
+        table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
+        up.addActionListener(e -> move(-1));
+        down.addActionListener(e -> move(1));
+        remove.addActionListener(e -> removeSelected());
+        save.addActionListener(e -> saveSelected());
+        variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor)));
+        insert.addActionListener(e -> insertVariable());
+        run.addActionListener(e -> runChain());
+        clear.addActionListener(e -> { steps.clear(); model.fireTableDataChanged(); showSelected(); log.setText(""); status.setText("Chain cleared. Add requests from Proxy history."); });
+        variableSearch.getDocument().addDocumentListener(new DocumentListener() {
+            public void insertUpdate(DocumentEvent e) { refreshVariables(); }
+            public void removeUpdate(DocumentEvent e) { refreshVariables(); }
+            public void changedUpdate(DocumentEvent e) { refreshVariables(); }
+        });
+        return root;
+    }
+
+    private final class Menu implements ContextMenuItemsProvider {
+        @Override public List<Component> provideMenuItems(ContextMenuEvent event) {
+            List<Component> menu = new ArrayList<>();
+            List<HttpRequestResponse> selected = new ArrayList<>(event.selectedRequestResponses());
+            event.messageEditorRequestResponse().ifPresent(editor -> {
+                if (selected.isEmpty()) selected.add(editor.requestResponse());
+            });
+            if (!selected.isEmpty()) {
+                if (selected.size() > 1 && event.isFromTool(ToolType.PROXY))
+                    java.util.Collections.reverse(selected);
+                JMenuItem add = new JMenuItem("Add to Requests Chainer (oldest first from Proxy history)");
+                add.addActionListener(e -> SwingUtilities.invokeLater(() -> addSteps(selected)));
+                menu.add(add);
+            }
+            event.messageEditorRequestResponse().ifPresent(editor -> {
+                if (editor.selectionContext() == MessageEditorHttpRequestResponse.SelectionContext.RESPONSE
+                        && editor.selectionOffsets().isPresent()) {
+                    JMenuItem capture = new JMenuItem("Requests Chainer: create variable from highlighted response value");
+                    capture.addActionListener(e -> SwingUtilities.invokeLater(() -> captureSelection(editor)));
+                    menu.add(capture);
+                }
+            });
+            return menu;
+        }
+    }
+
+    private void addSteps(List<HttpRequestResponse> items) {
+        for (HttpRequestResponse item : items) if (item.request() != null) steps.add(new ChainStep(item));
+        model.fireTableDataChanged();
+        if (!steps.isEmpty()) table.setRowSelectionInterval(steps.size() - 1, steps.size() - 1);
+        status.setText(steps.size() + " request(s) in chain. Use Move up/down to set execution order.");
+    }
+
+    private void captureSelection(MessageEditorHttpRequestResponse editor) {
+        HttpRequestResponse item = editor.requestResponse();
+        if (!item.hasResponse()) return;
+        Range range = editor.selectionOffsets().orElse(null);
+        if (range == null) return;
+        byte[] response = item.response().toByteArray().getBytes();
+        if (range.startIndexInclusive() < 0 || range.endIndexExclusive() > response.length) {
+            error("Selection is outside the response text"); return;
+        }
+        String value = new String(response, range.startIndexInclusive(),
+                range.endIndexExclusive() - range.startIndexInclusive(), StandardCharsets.UTF_8);
+        ChainStep step = selectedStep();
+        if (step == null || !step.url.equals(item.request().url())) {
+            step = new ChainStep(item);
+            steps.add(step);
+            model.fireTableDataChanged();
+            table.setRowSelectionInterval(steps.size() - 1, steps.size() - 1);
+        }
+        createVariable(step, value);
+    }
+
+    private void createVariable(ChainStep step, String selected) {
+        if (step == null) { error("Select a request first"); return; }
+        String value = selected.trim();
+        if (value.isEmpty()) value = guessSelectedValue(step);
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\""))
+            value = value.substring(1, value.length() - 1);
+        if (value.isEmpty() && step.lastResponse.isEmpty()) { error("La réponse de cette requête est vide"); return; }
+        String name = defineParameter(step, value);
+        if (name == null) return;
+        String selector = parameterSelector;
+        try {
+            step.outputs.put(name, selector);
+            refreshVariables();
+            model.fireTableDataChanged();
+            status.setText("Variable {{" + name + "}} configured for step " + (steps.indexOf(step) + 1));
+        } catch (Exception ex) { error("Could not parse JSON response: " + ex.getMessage()); }
+    }
+
+    private String guessSelectedValue(ChainStep step) {
+        String response = step.lastResponse;
+        java.util.regex.Matcher json = java.util.regex.Pattern.compile("\\\"(?:id|token|value)\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(response);
+        if (json.find()) return json.group(1);
+        java.util.regex.Matcher cookie = java.util.regex.Pattern.compile("(?:ENID|SESSION|TOKEN)=([^;\\s]+)", java.util.regex.Pattern.CASE_INSENSITIVE).matcher(response);
+        return cookie.find() ? cookie.group(1) : "";
+    }
+
+    private String parameterSelector;
+    private String defineParameter(ChainStep step, String value) {
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        JPanel fields = new JPanel(new java.awt.GridLayout(0, 2, 5, 5));
+        JTextField name = new JTextField("id");
+        // Use the complete HTTP response so headers such as Set-Cookie can be captured too.
+        String responseText = step.lastResponse;
+        String[] delimiters = defaultDelimiters(responseText, value);
+        JTextField prefix = new JTextField(delimiters[0]);
+        JTextField suffix = new JTextField(delimiters[1]);
+        JTextField regex = new JTextField(defaultRegex(responseText, value, delimiters[0], delimiters[1]));
+        JCheckBox caseSensitive = new JCheckBox("Case sensitive", true);
+        fields.add(new JLabel("Parameter name:")); fields.add(name);
+        fields.add(new JLabel("Define start (start after):")); fields.add(prefix);
+        fields.add(new JLabel("Define end (end before):")); fields.add(suffix);
+        panel.add(fields, BorderLayout.NORTH);
+        JRadioButton startEnd = new JRadioButton("Define start and end", true);
+        JRadioButton regexMode = new JRadioButton("Extract from regex group");
+        ButtonGroup modeGroup = new ButtonGroup();
+        modeGroup.add(startEnd);
+        modeGroup.add(regexMode);
+        JPanel modes = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        modes.add(startEnd); modes.add(regexMode);
+        JPanel regexPanel = new JPanel(new BorderLayout(4, 4));
+        regexPanel.setBorder(BorderFactory.createTitledBorder("Regex (capture group 1 is used)"));
+        regexPanel.add(regex, BorderLayout.CENTER); regexPanel.add(caseSensitive, BorderLayout.SOUTH); regexPanel.setVisible(false);
+        JLabel preview = new JLabel("Preview: " + value);
+        preview.setBorder(BorderFactory.createTitledBorder("Preview from current response"));
+        JPanel lower = new JPanel(new BorderLayout(6, 6));
+        lower.add(regexPanel, BorderLayout.NORTH);
+        lower.add(preview, BorderLayout.SOUTH);
+        HttpResponseEditor responseSample = api.userInterface().createHttpResponseEditor();
+        responseSample.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(responseText));
+        int selectedAt = responseText.indexOf(value);
+        Runnable syncSelection = () -> {
+            String selectedValue = responseSample.selection().map(s -> s.contents().toString()).orElse("").trim();
+            if (selectedValue.isEmpty()) return;
+            String[] selectedDelimiters = defaultDelimiters(responseText, selectedValue);
+            prefix.setText(selectedDelimiters[0]);
+            suffix.setText(selectedDelimiters[1]);
+            regex.setText(defaultRegex(responseText, selectedValue, selectedDelimiters[0], selectedDelimiters[1]));
+            preview.setText("Preview: " + selectedValue);
+        };
+        if (selectedAt >= 0) syncSelection.run();
+        javax.swing.Timer selectionTimer = new javax.swing.Timer(250, e -> syncSelection.run());
+        selectionTimer.start();
+        Component responseComponent = responseSample.uiComponent();
+        responseComponent.setPreferredSize(new java.awt.Dimension(740, 230));
+        lower.add(responseComponent, BorderLayout.CENTER);
+        JPanel center = new JPanel(new BorderLayout(6, 6));
+        center.add(modes, BorderLayout.NORTH);
+        center.add(lower, BorderLayout.CENTER);
+        panel.add(center, BorderLayout.CENTER);
+        Runnable refresh = () -> {
+            try {
+                String result = regexMode.isSelected() ? ChainEngine.extract(responseText,
+                        (caseSensitive.isSelected() ? "regex:" : "regexi:") + regex.getText())
+                        : ChainEngine.extract(responseText, "delim:" + encode(prefix.getText(), suffix.getText()));
+                preview.setText("Preview: " + result);
+            } catch (Exception ex) { preview.setText("Preview: no match"); }
+        };
+        java.awt.event.ActionListener modeListener = e -> { prefix.setEnabled(!regexMode.isSelected()); suffix.setEnabled(!regexMode.isSelected()); regexPanel.setVisible(regexMode.isSelected()); panel.revalidate(); refresh.run(); };
+        regexMode.addActionListener(modeListener);
+        startEnd.addActionListener(modeListener);
+        caseSensitive.addActionListener(e -> refresh.run());
+        panel.setPreferredSize(new java.awt.Dimension(760, 540));
+        javax.swing.event.DocumentListener listener = new javax.swing.event.DocumentListener() { public void insertUpdate(javax.swing.event.DocumentEvent e) { refresh.run(); } public void removeUpdate(javax.swing.event.DocumentEvent e) { refresh.run(); } public void changedUpdate(javax.swing.event.DocumentEvent e) { refresh.run(); } };
+        prefix.getDocument().addDocumentListener(listener); suffix.getDocument().addDocumentListener(listener); regex.getDocument().addDocumentListener(listener);
+        int result = JOptionPane.showConfirmDialog(null, panel, "Define custom parameter", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        selectionTimer.stop();
+        if (result != JOptionPane.OK_OPTION) return null;
+        if (!name.getText().matches("[A-Za-z][A-Za-z0-9_]*")) { error("Invalid variable name"); return null; }
+        if (regexMode.isSelected()) parameterSelector = (caseSensitive.isSelected() ? "regex:" : "regexi:") + regex.getText();
+        else parameterSelector = "delim:" + encode(prefix.getText(), suffix.getText());
+        return name.getText();
+    }
+
+    private JTextPane createColoredResponsePane(String text) {
+        JTextPane pane = new JTextPane();
+        pane.setEditable(false);
+        StyledDocument document = pane.getStyledDocument();
+        try { document.insertString(0, text, null); } catch (Exception ignored) { }
+        Style header = pane.addStyle("header", null); StyleConstants.setForeground(header, new Color(0x2367A8));
+        Style json = pane.addStyle("json", null); StyleConstants.setForeground(json, new Color(0x8A3B12));
+        int split = text.indexOf("\r\n\r\n"); if (split < 0) split = text.indexOf("\n\n");
+        if (split >= 0) document.setCharacterAttributes(0, split, header, false);
+        int bodyStart = split < 0 ? 0 : split + (text.startsWith("\r\n", split) ? 4 : 2);
+        if (bodyStart < text.length()) document.setCharacterAttributes(bodyStart, text.length() - bodyStart, json, false);
+        return pane;
+    }
+
+    private String[] defaultDelimiters(String body, String value) {
+        int at = body.indexOf(value);
+        if (at < 0) return new String[]{"", ""};
+        int line = Math.max(body.lastIndexOf("\n", at), body.lastIndexOf("\r", at));
+        int semi = body.lastIndexOf(';', at);
+        int start;
+        if (semi < line) {
+            start = line + 1;
+        } else {
+            start = semi + 1;
+            while (start < at && Character.isWhitespace(body.charAt(start))) start++;
+        }
+        String prefix = body.substring(start, at);
+        int lineEnd = body.indexOf('\n', at + value.length());
+        if (lineEnd < 0) lineEnd = body.length();
+        int contentEnd = lineEnd > 0 && body.charAt(lineEnd - 1) == '\r' ? lineEnd - 1 : lineEnd;
+        int end = body.indexOf(';', at + value.length());
+        if (end < 0 || end > lineEnd) end = -1;
+        String suffix = "";
+        if (end >= 0) {
+            int equals = body.indexOf('=', end + 1);
+            suffix = equals >= 0 ? body.substring(end, equals + 1) : body.substring(end);
+        } else {
+            suffix = body.substring(at + value.length(), contentEnd);
+        }
+        return new String[]{prefix, suffix};
+    }
+    private String escapeRegex(String value) { return value.replaceAll("([\\\\.\\[\\]{}()*+?^$|])", "\\\\$1"); }
+    private String defaultRegex(String response, String value, String prefix, String suffix) {
+        return escapeRegex(prefix) + "(.*?)" + escapeRegex(suffix);
+    }
+    private String encode(String prefix, String suffix) {
+        return java.util.Base64.getUrlEncoder().encodeToString(prefix.getBytes(StandardCharsets.UTF_8)) + "." + java.util.Base64.getUrlEncoder().encodeToString(suffix.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private void insertVariable() {
+        if (selectedStep() == null) { error("Select a destination request first"); return; }
+        String name = (String) variableBox.getSelectedItem();
+        if (name == null || name.isBlank()) { error("No variable matches the search"); return; }
+        String current = requestEditor.getRequest().toString();
+        String replacement = "{{" + name + "}}";
+        String updated;
+        java.util.Optional<String> selectedRequest = requestEditor.selection().map(s -> s.contents().toString());
+        if (selectedRequest.isPresent() && !selectedRequest.get().isEmpty()) {
+            int start = current.indexOf(selectedRequest.get());
+            updated = start < 0 ? current : current.substring(0, start) + replacement
+                    + current.substring(start + selectedRequest.get().length());
+        } else {
+            int caret = requestEditor.caretPosition();
+            updated = current.substring(0, caret) + replacement + current.substring(caret);
+        }
+        requestEditor.setRequest(HttpRequest.httpRequest(selectedStep().service, updated));
+        saveSelected();
+    }
+
+    private void saveSelected() { ChainStep step = selectedStep(); if (step != null) step.requestTemplate = requestEditor.getRequest().toString(); }
+    private void refreshVariables() {
+        String filter = variableSearch.getText().toLowerCase();
+        String current = (String) variableBox.getSelectedItem();
+        variableBox.removeAllItems();
+        steps.stream().flatMap(s -> s.outputs.keySet().stream()).distinct()
+                .filter(v -> v.toLowerCase().contains(filter)).forEach(variableBox::addItem);
+        if (current != null) variableBox.setSelectedItem(current);
+    }
+    private String selectedText(HttpResponseEditor area) { return area.selection().map(s -> s.contents().toString()).orElse(""); }
+    private ChainStep selectedStep() { int row = table.getSelectedRow(); return row < 0 || row >= steps.size() ? null : steps.get(row); }
+    private void showSelected() {
+        if (displayedStep != null) displayedStep.requestTemplate = requestEditor.getRequest().toString();
+        ChainStep step = selectedStep();
+        displayedStep = step;
+        if (step != null) {
+            requestEditor.setRequest(HttpRequest.httpRequest(step.service, step.requestTemplate));
+            responseEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(step.lastResponse));
+        } else {
+            requestEditor.setRequest(HttpRequest.httpRequest());
+            responseEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse());
+        }
+        requestEditor.setCaretPosition(0); responseEditor.setCaretPosition(0);
+    }
+    private void move(int delta) {
+        int index = table.getSelectedRow(), target = index + delta;
+        if (index < 0 || target < 0 || target >= steps.size()) return;
+        saveSelected();
+        java.util.Collections.swap(steps, index, target);
+        model.fireTableDataChanged(); table.setRowSelectionInterval(target, target);
+    }
+    private void removeSelected() {
+        int index = table.getSelectedRow(); if (index < 0) return;
+        steps.remove(index); model.fireTableDataChanged();
+        if (!steps.isEmpty()) table.setRowSelectionInterval(Math.min(index, steps.size() - 1), Math.min(index, steps.size() - 1));
+        else showSelected();
+    }
+
+    private void runChain() {
+        if (running) { error("A chain is already running"); return; }
+        if (steps.isEmpty()) {
+            status.setText("Nothing to run: add at least one request from Proxy history.");
+            log.append("Run chain ignored: the chain is empty.\n");
+            log.setCaretPosition(log.getDocument().getLength());
+            return;
+        }
+        saveSelected();
+        List<ChainStep> snapshot = List.copyOf(steps);
+        int repetitions = ((Number) repetitionCount.getValue()).intValue();
+        running = true;
+        log.append("Starting " + repetitions + " run(s), " + snapshot.size() + " step(s) each...\n");
+        log.setCaretPosition(log.getDocument().getLength());
+        status.setText("Running " + snapshot.size() + " request(s)...");
+        new SwingWorker<Void, String>() {
+            @Override protected Void doInBackground() throws Exception {
+                List<ChainEngine.Step> definitions = snapshot.stream()
+                        .map(step -> new ChainEngine.Step(step.requestTemplate, Map.copyOf(step.outputs))).toList();
+                for (int run = 1; run <= repetitions; run++) {
+                    final int runNumber = run;
+                    publish("Run " + runNumber + "/" + repetitions + " started");
+                    ChainEngine.run(definitions, (index, raw) -> {
+                        ChainStep step = snapshot.get(index);
+                        HttpRequest request = HttpRequest.httpRequest(step.service, raw);
+                        HttpRequestResponse result = api.http().sendRequest(request);
+                        if (!result.hasResponse()) return null;
+                        step.lastResponse = result.response().toString();
+                        step.lastResponse = result.response().toString();
+                        step.lastResponseBody = result.response().bodyToString();
+                        return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
+                    }, message -> publish("Run " + runNumber + ": " + message));
+                }
+                return null;
+            }
+            @Override protected void process(List<String> messages) {
+                for (String message : messages) log.append(message + "\n");
+                showSelected();
+            }
+            @Override protected void done() {
+                running = false;
+                try { get(); status.setText("Chain finished successfully."); }
+                catch (Exception ex) {
+                    Throwable cause = ex.getCause() == null ? ex : ex.getCause();
+                    status.setText("Chain stopped: " + cause.getMessage());
+                    log.append(status.getText() + "\n");
+                }
+            }
+        }.execute();
+    }
+
+    private void error(String message) { JOptionPane.showMessageDialog(null, message, "Requests Chainer", JOptionPane.ERROR_MESSAGE); }
+
+    private final class StepTable extends AbstractTableModel {
+        @Override public int getRowCount() { return steps.size(); }
+        @Override public int getColumnCount() { return 3; }
+        @Override public String getColumnName(int column) { return switch (column) { case 0 -> "Order"; case 1 -> "Request"; default -> "Variables from response"; }; }
+        @Override public Object getValueAt(int row, int column) {
+            ChainStep step = steps.get(row);
+            return switch (column) { case 0 -> row + 1; case 1 -> step.url; default -> step.outputs.toString(); };
+        }
+    }
+}
