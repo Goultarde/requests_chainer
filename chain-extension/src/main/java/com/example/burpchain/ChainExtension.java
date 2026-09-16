@@ -23,6 +23,8 @@ import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.Color;
+import java.awt.Toolkit;
+import java.awt.datatransfer.StringSelection;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
@@ -109,6 +111,7 @@ public final class ChainExtension implements BurpExtension {
         JButton variable = new JButton("Variable from response selection");
         JButton insert = new JButton("Insert variable");
         JButton intruder = new JButton("Send target to Intruder");
+        JButton sessionRule = new JButton("Configure Intruder session rule");
         JButton saveChain = new JButton("Save chain");
         JButton loadChain = new JButton("Load chain");
         JButton deleteVariable = new JButton("Delete variable");
@@ -124,7 +127,7 @@ public final class ChainExtension implements BurpExtension {
         run.setToolTipText("Execute the requests in the table in order");
         JButton clear = new JButton("Clear chain");
         buttons.add(run); buttons.add(clear); buttons.add(up); buttons.add(down); buttons.add(remove);
-        buttons.add(save); buttons.add(variable); buttons.add(insert); buttons.add(intruder);
+        buttons.add(save); buttons.add(variable); buttons.add(insert); buttons.add(intruder); buttons.add(sessionRule);
         buttons.add(saveChain); buttons.add(loadChain); buttons.add(deleteVariable); buttons.add(editVariable);
         buttons.add(replaceAll);
         buttons.add(propagateHeader);
@@ -179,6 +182,10 @@ public final class ChainExtension implements BurpExtension {
         root.getActionMap().put("requests-chainer-run", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { runChain(); }
         });
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control I"), "requests-chainer-intruder");
+        root.getActionMap().put("requests-chainer-intruder", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { sendTargetToIntruder(); }
+        });
         root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control Z"), "requests-chainer-undo");
         root.getActionMap().put("requests-chainer-undo", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { undoRequestEdit(); }
@@ -192,6 +199,7 @@ public final class ChainExtension implements BurpExtension {
         variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor)));
         insert.addActionListener(e -> insertVariable());
         intruder.addActionListener(e -> sendTargetToIntruder());
+        sessionRule.addActionListener(e -> showSessionRuleInstructions());
         saveChain.addActionListener(e -> saveChain());
         loadChain.addActionListener(e -> loadChain());
         deleteVariable.addActionListener(e -> deleteVariable());
@@ -208,6 +216,43 @@ public final class ChainExtension implements BurpExtension {
             public void changedUpdate(DocumentEvent e) { refreshVariables(); }
         });
         return root;
+    }
+
+    private void showSessionRuleInstructions() {
+        JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(suiteTab),
+                "Configure Intruder session rule", java.awt.Dialog.ModalityType.APPLICATION_MODAL);
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+        JTextArea instructions = new JTextArea(
+                "Requests Chainer — Intruder session rule\n\n"
+                + "1. Open Settings → Sessions → Session handling rules.\n"
+                + "2. Click Add.\n"
+                + "3. Add the action: Invoke a Burp extension.\n"
+                + "4. Select: Requests Chainer - run preceding chain.\n"
+                + "5. Set the scope to: Include all URLs.\n"
+                + "6. Enable the rule and click OK.\n\n"
+                + "Then use Send target to Intruder in Requests Chainer before starting Intruder.");
+        instructions.setEditable(false);
+        instructions.setOpaque(false);
+        instructions.setLineWrap(true);
+        instructions.setWrapStyleWord(true);
+        panel.add(instructions, BorderLayout.CENTER);
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton copy = new JButton("Copy action name");
+        copy.addActionListener(e -> {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+                    new StringSelection("Requests Chainer - run preceding chain"), null);
+            status.setText("Session handling action name copied to clipboard.");
+        });
+        JButton close = new JButton("Close");
+        close.addActionListener(e -> dialog.dispose());
+        actions.add(copy);
+        actions.add(close);
+        panel.add(actions, BorderLayout.SOUTH);
+        dialog.setContentPane(panel);
+        dialog.setSize(600, 340);
+        dialog.setLocationRelativeTo(suiteTab);
+        dialog.setVisible(true);
     }
 
     private final class Menu implements ContextMenuItemsProvider {
@@ -576,8 +621,8 @@ public final class ChainExtension implements BurpExtension {
             String updated = step.requestTemplate.replace(search.getText(), replacement.getText());
             if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
         }
-        model.fireTableDataChanged();
         displayedStep = null;
+        model.fireTableDataChanged();
         showSelected();
         status.setText("Replaced '" + search.getText() + "' in " + changed + " request(s).");
     }
@@ -596,7 +641,7 @@ public final class ChainExtension implements BurpExtension {
             String updated = pattern.matcher(step.requestTemplate).replaceAll("$1{{" + java.util.regex.Matcher.quoteReplacement(variable) + "}}");
             if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
         }
-        model.fireTableDataChanged(); displayedStep = null; showSelected();
+        displayedStep = null; model.fireTableDataChanged(); showSelected();
         status.setText("Header " + header.getText() + " now uses {{" + variable + "}} in " + changed + " request(s).");
     }
     private String b64(String value) { return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8)); }
