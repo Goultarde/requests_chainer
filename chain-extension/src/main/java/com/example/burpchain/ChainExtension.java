@@ -618,7 +618,10 @@ public final class ChainExtension implements BurpExtension {
         if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
         try {
             List<String> lines = java.nio.file.Files.readAllLines(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8);
-            if (lines.isEmpty() || !lines.get(0).equals("REQUESTS-CHAINS-1")) throw new IOException("Invalid chain file");
+            if (lines.isEmpty() || !(lines.get(0).equals("REQUESTS-CHAINS-1") || lines.get(0).equals("REQUESTS-CHAIN-1"))) throw new IOException("Invalid chain file");
+            boolean legacy = lines.get(0).equals("REQUESTS-CHAIN-1");
+            namedChains.clear();
+            if (legacy) namedChains.put("Default", new ArrayList<>());
             List<ChainStep> loaded = new ArrayList<>(); ChainStep current = null;
             for (String line : lines.subList(1, lines.size())) {
                 String[] parts = line.split("\\t", -1);
@@ -627,7 +630,7 @@ public final class ChainExtension implements BurpExtension {
                 } else if (parts[0].equals("S")) {
                     HttpService service = HttpService.httpService(unb64(parts[1]), Integer.parseInt(parts[2]), Boolean.parseBoolean(parts[3]));
                     current = new ChainStep(service, unb64(parts[4]));
-                    String active = namedChains.keySet().stream().reduce((a, b) -> b).orElse("Default");
+                    String active = legacy ? "Default" : namedChains.keySet().stream().reduce((a, b) -> b).orElse("Default");
                     namedChains.get(active).add(current);
                 } else if (parts[0].equals("V") && current != null) current.outputs.put(unb64(parts[1]), unb64(parts[2]));
             }
