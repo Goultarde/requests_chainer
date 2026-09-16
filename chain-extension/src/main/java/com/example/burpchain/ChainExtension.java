@@ -66,7 +66,11 @@ public final class ChainExtension implements BurpExtension {
     private volatile boolean intruderChainEnabled;
     private volatile String intruderTargetUrl;
     private volatile int intruderTargetIndex;
+    private final ThreadLocal<Boolean> intruderChainRunning = ThreadLocal.withInitial(() -> false);
     private final List<ChainStep> steps = new ArrayList<>();
+    private final Map<String, List<ChainStep>> namedChains = new LinkedHashMap<>();
+    private String currentChainName = "Default";
+    private boolean switchingChain;
     private final StepTable model = new StepTable();
     private final JTable table = new JTable(model);
     private HttpRequestEditor requestEditor;
@@ -76,6 +80,7 @@ public final class ChainExtension implements BurpExtension {
     private volatile boolean running;
     private ChainStep displayedStep;
     private final JComboBox<String> variableBox = new JComboBox<>();
+    private final JComboBox<String> chainSelector = new JComboBox<>();
     private final JTextField variableSearch = new JTextField(12);
     private final JSpinner repetitionCount = new JSpinner(new SpinnerNumberModel(1, 1, 1000, 1));
     private final Deque<String> requestUndo = new ArrayDeque<>();
@@ -107,6 +112,7 @@ public final class ChainExtension implements BurpExtension {
         JButton editVariable = new JButton("Edit variable");
         JButton replaceAll = new JButton("Replace in all requests");
         JButton propagateHeader = new JButton("Use variable in all headers");
+        JButton newChain = new JButton("New chain");
         variable.setBackground(new Color(0x2F75B5));
         variable.setForeground(Color.WHITE);
         variable.setOpaque(true);
@@ -119,6 +125,7 @@ public final class ChainExtension implements BurpExtension {
         buttons.add(saveChain); buttons.add(loadChain); buttons.add(deleteVariable); buttons.add(editVariable);
         buttons.add(replaceAll);
         buttons.add(propagateHeader);
+        chainSelector.addItem(currentChainName);
         run.setBackground(new Color(0xE8752A));
         run.setForeground(Color.WHITE);
         run.setOpaque(true);
@@ -131,6 +138,9 @@ public final class ChainExtension implements BurpExtension {
         variableBar.add(new JLabel("Runs:"));
         repetitionCount.setToolTipText("Number of complete chain executions (1-1000)");
         variableBar.add(repetitionCount);
+        variableBar.add(new JLabel("Chain:"));
+        variableBar.add(chainSelector);
+        variableBar.add(newChain);
         JPanel top = new JPanel();
         top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
         buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
@@ -183,6 +193,8 @@ public final class ChainExtension implements BurpExtension {
         loadChain.addActionListener(e -> loadChain());
         deleteVariable.addActionListener(e -> deleteVariable());
         editVariable.addActionListener(e -> editVariable());
+        newChain.addActionListener(e -> createNewChain());
+        chainSelector.addActionListener(e -> switchChain((String) chainSelector.getSelectedItem()));
         replaceAll.addActionListener(e -> replaceAcrossRequests());
         propagateHeader.addActionListener(e -> propagateVariableHeader());
         run.addActionListener(e -> runChain());
@@ -226,6 +238,31 @@ public final class ChainExtension implements BurpExtension {
         model.fireTableDataChanged();
         if (!steps.isEmpty()) table.setRowSelectionInterval(steps.size() - 1, steps.size() - 1);
         status.setText(steps.size() + " request(s) in chain. Use Move up/down to set execution order.");
+    }
+
+    private void storeCurrentChain() {
+        saveSelected();
+        namedChains.put(currentChainName, new ArrayList<>(steps));
+    }
+    private void switchChain(String name) {
+        if (switchingChain || name == null || name.equals(currentChainName)) return;
+        storeCurrentChain();
+        switchingChain = true;
+        steps.clear();
+        steps.addAll(namedChains.getOrDefault(name, List.of()));
+        currentChainName = name;
+        model.fireTableDataChanged(); refreshVariables(); showSelected();
+        switchingChain = false;
+        status.setText("Chain selected: " + name);
+    }
+    private void createNewChain() {
+        String name = JOptionPane.showInputDialog(null, "Chain name:", "New chain", JOptionPane.PLAIN_MESSAGE);
+        if (name == null || name.isBlank() || namedChains.containsKey(name)) return;
+        storeCurrentChain();
+        namedChains.put(name, new ArrayList<>());
+        switchingChain = true; chainSelector.addItem(name); chainSelector.setSelectedItem(name); switchingChain = false;
+        steps.clear(); currentChainName = name; model.fireTableDataChanged(); refreshVariables(); showSelected();
+        status.setText("New chain created: " + name);
     }
 
     private void captureSelection(MessageEditorHttpRequestResponse editor) {
@@ -523,7 +560,8 @@ public final class ChainExtension implements BurpExtension {
     }
     private void replaceAcrossRequests() {
         JPanel panel = new JPanel(new java.awt.GridLayout(2, 2, 6, 6));
-        JTextField search = new JTextField();
+        String selected = requestEditor.selection().map(s -> s.contents().toString()).orElse("");
+        JTextField search = new JTextField(selected);
         JTextField replacement = new JTextField();
         panel.add(new JLabel("Search:")); panel.add(search);
         panel.add(new JLabel("Replace with:")); panel.add(replacement);
@@ -563,11 +601,14 @@ public final class ChainExtension implements BurpExtension {
         JFileChooser chooser = new JFileChooser();
         if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
         try (java.io.BufferedWriter out = java.nio.file.Files.newBufferedWriter(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8)) {
-            saveSelected(); out.write("REQUESTS-CHAIN-1\n");
-            for (ChainStep step : steps) {
+            storeCurrentChain(); out.write("REQUESTS-CHAINS-1\n");
+            for (Map.Entry<String, List<ChainStep>> chain : namedChains.entrySet()) {
+                out.write("C\t" + b64(chain.getKey()) + "\n");
+                for (ChainStep step : chain.getValue()) {
                 out.write("S\t" + b64(step.service.host()) + "\t" + step.service.port() + "\t" + step.service.secure() + "\t" + b64(step.requestTemplate) + "\n");
                 for (Map.Entry<String, String> output : step.outputs.entrySet()) out.write("V\t" + b64(output.getKey()) + "\t" + b64(output.getValue()) + "\n");
                 out.write("E\n");
+                }
             }
             status.setText("Chain saved: " + chooser.getSelectedFile().getName());
         } catch (Exception ex) { error("Cannot save chain: " + ex.getMessage()); }
@@ -577,16 +618,22 @@ public final class ChainExtension implements BurpExtension {
         if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
         try {
             List<String> lines = java.nio.file.Files.readAllLines(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8);
-            if (lines.isEmpty() || !lines.get(0).equals("REQUESTS-CHAIN-1")) throw new IOException("Invalid chain file");
+            if (lines.isEmpty() || !lines.get(0).equals("REQUESTS-CHAINS-1")) throw new IOException("Invalid chain file");
             List<ChainStep> loaded = new ArrayList<>(); ChainStep current = null;
             for (String line : lines.subList(1, lines.size())) {
                 String[] parts = line.split("\\t", -1);
-                if (parts[0].equals("S")) {
+                if (parts[0].equals("C")) {
+                    String name = unb64(parts[1]); namedChains.put(name, new ArrayList<>()); current = null;
+                } else if (parts[0].equals("S")) {
                     HttpService service = HttpService.httpService(unb64(parts[1]), Integer.parseInt(parts[2]), Boolean.parseBoolean(parts[3]));
-                    current = new ChainStep(service, unb64(parts[4])); loaded.add(current);
+                    current = new ChainStep(service, unb64(parts[4]));
+                    String active = namedChains.keySet().stream().reduce((a, b) -> b).orElse("Default");
+                    namedChains.get(active).add(current);
                 } else if (parts[0].equals("V") && current != null) current.outputs.put(unb64(parts[1]), unb64(parts[2]));
             }
-            steps.clear(); steps.addAll(loaded); model.fireTableDataChanged(); refreshVariables();
+            namedChains.keySet().forEach(n -> { if (((javax.swing.DefaultComboBoxModel<String>) chainSelector.getModel()).getIndexOf(n) < 0) chainSelector.addItem(n); });
+            if (!namedChains.isEmpty()) { currentChainName = namedChains.keySet().iterator().next(); steps.clear(); steps.addAll(namedChains.get(currentChainName)); chainSelector.setSelectedItem(currentChainName); }
+            model.fireTableDataChanged(); refreshVariables();
             if (!steps.isEmpty()) table.setRowSelectionInterval(0, 0);
             status.setText("Chain loaded: " + chooser.getSelectedFile().getName());
         } catch (Exception ex) { error("Cannot load chain: " + ex.getMessage()); }
@@ -709,26 +756,32 @@ public final class ChainExtension implements BurpExtension {
     private final class IntruderChainHandler implements HttpHandler {
         @Override public RequestToBeSentAction handleHttpRequestToBeSent(HttpRequestToBeSent request) {
             if (!intruderChainEnabled || !request.toolSource().isFromTool(ToolType.INTRUDER)
+                    || intruderChainRunning.get()
                     || intruderTargetUrl == null || !intruderTargetUrl.equals(request.url()))
                 return RequestToBeSentAction.continueWith(request);
             try {
+                intruderChainRunning.set(true);
+                long started = System.nanoTime();
                 List<ChainStep> before = List.copyOf(steps.subList(0, intruderTargetIndex));
                 List<ChainEngine.Step> definitions = before.stream()
                         .map(step -> new ChainEngine.Step(step.requestTemplate, Map.copyOf(step.outputs))).toList();
                 Map<String, String> variables = ChainEngine.run(definitions, (index, raw) -> {
+                    long stepStarted = System.nanoTime();
                     ChainStep step = before.get(index);
                     HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
                     if (!result.hasResponse()) return null;
                     step.lastResponse = result.response().toString();
                     step.lastResponseBody = result.response().bodyToString();
+                    appendLog("Intruder chain step " + (index + 1) + " took " + ((System.nanoTime() - stepStarted) / 1_000_000) + " ms");
                     return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
                 }, message -> appendLog("Intruder chain: " + message));
+                appendLog("Intruder chain preparation took " + ((System.nanoTime() - started) / 1_000_000) + " ms");
                 return RequestToBeSentAction.continueWith(HttpRequest.httpRequest(request.httpService(),
                         Template.renderHttpRequest(request.toString(), variables)));
             } catch (Exception ex) {
                 api.logging().logToError("Intruder chain failed: " + ex.getMessage());
                 return RequestToBeSentAction.continueWith(request);
-            }
+            } finally { intruderChainRunning.set(false); }
         }
         @Override public ResponseReceivedAction handleHttpResponseReceived(burp.api.montoya.http.handler.HttpResponseReceived response) {
             return ResponseReceivedAction.continueWith(response);
