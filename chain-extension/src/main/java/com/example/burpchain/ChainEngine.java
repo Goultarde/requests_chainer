@@ -53,10 +53,12 @@ public final class ChainEngine {
             if (encoded.length != 2) throw new IOException("Invalid start/end extractor");
             String prefix = new String(Base64.getUrlDecoder().decode(encoded[0]), StandardCharsets.UTF_8);
             String suffix = new String(Base64.getUrlDecoder().decode(encoded[1]), StandardCharsets.UTF_8);
-            int start = prefix.isEmpty() ? 0 : findDelimiter(body, prefix, 0);
+            // Adapted from ExtendedMacro (MIT): locate the start string, then
+            // locate the stop string in the remaining response text.
+            int start = prefix.isEmpty() ? 0 : body.indexOf(prefix);
             if (start < 0) throw new IOException("Start expression did not match the response");
             start += prefix.length();
-            int end = suffix.isEmpty() ? body.length() : findDelimiter(body, suffix, start);
+            int end = suffix.isEmpty() ? body.length() : body.indexOf(suffix, start);
             if (end < 0) throw new IOException("End expression did not match the response");
             String extracted = body.substring(start, end);
             if (extracted.isEmpty()) throw new IOException("Start/end extractor produced an empty value");
@@ -74,14 +76,4 @@ public final class ChainEngine {
         return separator >= 0 ? response.substring(separator + 2) : response;
     }
 
-    private static int findDelimiter(String body, String delimiter, int from) {
-        StringBuilder expression = new StringBuilder();
-        for (int i = 0; i < delimiter.length(); i++) {
-            char c = delimiter.charAt(i);
-            if (Character.isWhitespace(c)) { while (i + 1 < delimiter.length() && Character.isWhitespace(delimiter.charAt(i + 1))) i++; expression.append("\\s*"); }
-            else { if ("\\.^$|?*+()[]{}".indexOf(c) >= 0) expression.append('\\'); expression.append(c); }
-        }
-        Matcher matcher = Pattern.compile(expression.toString(), Pattern.DOTALL).matcher(body);
-        return matcher.find(from) ? matcher.start() : -1;
-    }
 }

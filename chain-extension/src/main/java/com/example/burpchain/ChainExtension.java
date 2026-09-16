@@ -283,7 +283,7 @@ public final class ChainExtension implements BurpExtension {
         JTextField name = new JTextField(parameterNameDefault);
         // Use the complete HTTP response so headers such as Set-Cookie can be captured too.
         String responseText = step.lastResponse;
-        String[] delimiters = defaultDelimiters(responseText, value);
+        String[] delimiters = bestDelimiters(responseText, value);
         JTextField prefix = new JTextField(delimiters[0]);
         JTextField suffix = new JTextField(delimiters[1]);
         JTextField regex = new JTextField(defaultRegex(responseText, value, delimiters[0], delimiters[1]));
@@ -313,7 +313,7 @@ public final class ChainExtension implements BurpExtension {
         Runnable syncSelection = () -> {
             String selectedValue = responseSample.selection().map(s -> s.contents().toString()).orElse("").trim();
             if (selectedValue.isEmpty()) return;
-            String[] selectedDelimiters = defaultDelimiters(responseText, selectedValue);
+            String[] selectedDelimiters = bestDelimiters(responseText, selectedValue);
             prefix.setText(selectedDelimiters[0]);
             suffix.setText(selectedDelimiters[1]);
             regex.setText(defaultRegex(responseText, selectedValue, selectedDelimiters[0], selectedDelimiters[1]));
@@ -394,9 +394,29 @@ public final class ChainExtension implements BurpExtension {
         }
         return new String[]{prefix, suffix};
     }
+    private String[] bestDelimiters(String response, String value) {
+        // Algorithm adapted from ExtendedMacro's ExtStringCreator (MIT license).
+        int at = response.indexOf(value);
+        if (at < 0 || value.isEmpty()) return defaultDelimiters(response, value);
+        int before = Math.max(0, at - 8), after = Math.min(response.length(), at + value.length() + 8);
+        while (true) {
+            String prefix = response.substring(before, at);
+            String suffix = response.substring(at + value.length(), after);
+            int start = prefix.isEmpty() ? 0 : response.indexOf(prefix);
+            int end = start < 0 ? -1 : response.indexOf(suffix, start + prefix.length());
+            String extracted = start < 0 || end < 0 ? "" : response.substring(start + prefix.length(), end);
+            if (value.equals(extracted)) return new String[]{prefix, suffix};
+            int oldBefore = before, oldAfter = after;
+            before = Math.max(0, before - 8);
+            after = Math.min(response.length(), after + 8);
+            if (before == oldBefore && after == oldAfter) break;
+        }
+        return defaultDelimiters(response, value);
+    }
     private String escapeRegex(String value) { return value.replaceAll("([\\\\.\\[\\]{}()*+?^$|])", "\\\\$1"); }
     private String defaultRegex(String response, String value, String prefix, String suffix) {
-        return escapeRegex(prefix) + "(.*?)" + escapeRegex(suffix);
+        String[] best = bestDelimiters(response, value);
+        return escapeRegex(best[0]) + "(.*?)" + escapeRegex(best[1]);
     }
     private String encode(String prefix, String suffix) {
         return java.util.Base64.getUrlEncoder().encodeToString(prefix.getBytes(StandardCharsets.UTF_8)) + "." + java.util.Base64.getUrlEncoder().encodeToString(suffix.getBytes(StandardCharsets.UTF_8));
