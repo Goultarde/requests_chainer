@@ -14,6 +14,9 @@ import burp.api.montoya.http.handler.ResponseReceivedAction;
 import burp.api.montoya.http.sessions.ActionResult;
 import burp.api.montoya.http.sessions.SessionHandlingAction;
 import burp.api.montoya.http.sessions.SessionHandlingActionData;
+import burp.api.montoya.scanner.AuditConfiguration;
+import burp.api.montoya.scanner.BuiltInAuditConfiguration;
+import burp.api.montoya.scanner.audit.Audit;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
@@ -53,6 +56,7 @@ import javax.swing.JSpinner;
 import javax.swing.SpinnerNumberModel;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import javax.swing.JPopupMenu;
 import javax.swing.JLabel;
 import javax.swing.JMenuItem;
 import javax.swing.JOptionPane;
@@ -192,6 +196,10 @@ public final class ChainExtension implements BurpExtension {
         });
         table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
         table.setCellSelectionEnabled(true);
+        table.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override public void mousePressed(java.awt.event.MouseEvent e) { showTablePopup(e); }
+            @Override public void mouseReleased(java.awt.event.MouseEvent e) { showTablePopup(e); }
+        });
         up.addActionListener(e -> move(-1));
         down.addActionListener(e -> move(1));
         remove.addActionListener(e -> removeSelected());
@@ -216,6 +224,33 @@ public final class ChainExtension implements BurpExtension {
             public void changedUpdate(DocumentEvent e) { refreshVariables(); }
         });
         return root;
+    }
+
+    private void showTablePopup(java.awt.event.MouseEvent event) {
+        if (!event.isPopupTrigger()) return;
+        int row = table.rowAtPoint(event.getPoint());
+        if (row >= 0 && !table.isRowSelected(row)) table.setRowSelectionInterval(row, row);
+        if (table.getSelectedRowCount() == 0) return;
+        JPopupMenu popup = new JPopupMenu();
+        JMenuItem scan = new JMenuItem("Start active scan");
+        scan.addActionListener(e -> startActiveScanForSelection());
+        popup.add(scan);
+        popup.show(table, event.getX(), event.getY());
+    }
+
+    private void startActiveScanForSelection() {
+        if (api == null) return;
+        try {
+            Audit audit = api.scanner().startAudit(AuditConfiguration.auditConfiguration(
+                    BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS));
+            for (int row : table.getSelectedRows()) {
+                ChainStep step = steps.get(row);
+                audit.addRequest(HttpRequest.httpRequest(step.service, step.requestTemplate));
+            }
+            status.setText("Active scan started for " + table.getSelectedRowCount() + " request(s).");
+        } catch (Exception ex) {
+            error("Cannot start active scan: " + ex.getMessage());
+        }
     }
 
     private void showSessionRuleInstructions() {
