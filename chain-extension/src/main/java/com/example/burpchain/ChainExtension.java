@@ -5,6 +5,7 @@ import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Range;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.requests.HttpRequest;
 import burp.api.montoya.http.handler.HttpHandler;
 import burp.api.montoya.http.handler.HttpRequestToBeSent;
@@ -19,7 +20,10 @@ import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.Color;
+import java.io.IOException;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -74,6 +78,7 @@ public final class ChainExtension implements BurpExtension {
     private final JComboBox<String> variableBox = new JComboBox<>();
     private final JTextField variableSearch = new JTextField(12);
     private final JSpinner repetitionCount = new JSpinner(new SpinnerNumberModel(1, 1, 1000, 1));
+    private final Deque<String> requestUndo = new ArrayDeque<>();
 
     @Override public void initialize(MontoyaApi api) {
         this.api = api;
@@ -96,6 +101,10 @@ public final class ChainExtension implements BurpExtension {
         JButton variable = new JButton("Variable from response selection");
         JButton insert = new JButton("Insert variable");
         JButton intruder = new JButton("Send target to Intruder");
+        JButton saveChain = new JButton("Save chain");
+        JButton loadChain = new JButton("Load chain");
+        JButton deleteVariable = new JButton("Delete variable");
+        JButton editVariable = new JButton("Edit variable");
         variable.setBackground(new Color(0x2F75B5));
         variable.setForeground(Color.WHITE);
         variable.setOpaque(true);
@@ -105,6 +114,7 @@ public final class ChainExtension implements BurpExtension {
         JButton clear = new JButton("Clear chain");
         buttons.add(run); buttons.add(clear); buttons.add(up); buttons.add(down); buttons.add(remove);
         buttons.add(save); buttons.add(variable); buttons.add(insert); buttons.add(intruder);
+        buttons.add(saveChain); buttons.add(loadChain); buttons.add(deleteVariable); buttons.add(editVariable);
         run.setBackground(new Color(0xE8752A));
         run.setForeground(Color.WHITE);
         run.setOpaque(true);
@@ -152,14 +162,23 @@ public final class ChainExtension implements BurpExtension {
         root.getActionMap().put("requests-chainer-run", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { runChain(); }
         });
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control Z"), "requests-chainer-undo");
+        root.getActionMap().put("requests-chainer-undo", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { undoRequestEdit(); }
+        });
         table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
+        table.setCellSelectionEnabled(true);
         up.addActionListener(e -> move(-1));
         down.addActionListener(e -> move(1));
         remove.addActionListener(e -> removeSelected());
-        save.addActionListener(e -> saveSelected());
+        save.addActionListener(e -> { saveSelected(); status.setText("Request edit saved for the selected chain step."); });
         variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor)));
         insert.addActionListener(e -> insertVariable());
         intruder.addActionListener(e -> sendTargetToIntruder());
+        saveChain.addActionListener(e -> saveChain());
+        loadChain.addActionListener(e -> loadChain());
+        deleteVariable.addActionListener(e -> deleteVariable());
+        editVariable.addActionListener(e -> editVariable());
         run.addActionListener(e -> runChain());
         clear.addActionListener(e -> { steps.clear(); model.fireTableDataChanged(); showSelected(); log.setText(""); status.setText("Chain cleared. Add requests from Proxy history."); });
         variableSearch.getDocument().addDocumentListener(new DocumentListener() {
@@ -233,6 +252,12 @@ public final class ChainExtension implements BurpExtension {
         if (value.isEmpty() && step.lastResponse.isEmpty()) { error("La réponse de cette requête est vide"); return; }
         String name = defineParameter(step, value);
         if (name == null) return;
+        for (ChainStep existing : steps) {
+            if (existing != step && existing.outputs.containsKey(name)) {
+                error("Variable {{" + name + "}} already exists on another step. Delete it first or choose another name.");
+                return;
+            }
+        }
         String selector = parameterSelector;
         try {
             step.outputs.put(name, selector);
@@ -251,10 +276,11 @@ public final class ChainExtension implements BurpExtension {
     }
 
     private String parameterSelector;
+    private String parameterNameDefault = "id";
     private String defineParameter(ChainStep step, String value) {
         JPanel panel = new JPanel(new BorderLayout(8, 8));
         JPanel fields = new JPanel(new java.awt.GridLayout(0, 2, 5, 5));
-        JTextField name = new JTextField("id");
+        JTextField name = new JTextField(parameterNameDefault);
         // Use the complete HTTP response so headers such as Set-Cookie can be captured too.
         String responseText = step.lastResponse;
         String[] delimiters = defaultDelimiters(responseText, value);
@@ -396,7 +422,21 @@ public final class ChainExtension implements BurpExtension {
         saveSelected();
     }
 
-    private void saveSelected() { ChainStep step = selectedStep(); if (step != null) step.requestTemplate = requestEditor.getRequest().toString(); }
+    private void saveSelected() {
+        ChainStep step = selectedStep();
+        if (step != null) {
+            String updated = requestEditor.getRequest().toString();
+            if (!updated.equals(step.requestTemplate)) requestUndo.push(step.requestTemplate);
+            step.requestTemplate = updated;
+        }
+    }
+    private void undoRequestEdit() {
+        ChainStep step = selectedStep();
+        if (step == null || requestUndo.isEmpty()) return;
+        step.requestTemplate = requestUndo.pop();
+        requestEditor.setRequest(HttpRequest.httpRequest(step.service, step.requestTemplate));
+        status.setText("Last request edit undone.");
+    }
     private void refreshVariables() {
         String filter = variableSearch.getText().toLowerCase();
         String current = (String) variableBox.getSelectedItem();
@@ -426,6 +466,61 @@ public final class ChainExtension implements BurpExtension {
         saveSelected();
         java.util.Collections.swap(steps, index, target);
         model.fireTableDataChanged(); table.setRowSelectionInterval(target, target);
+    }
+    private void deleteVariable() {
+        String name = (String) variableBox.getSelectedItem();
+        if (name == null || name.isBlank()) { error("Select a variable first"); return; }
+        int removed = 0;
+        for (ChainStep step : steps) if (step.outputs.remove(name) != null) removed++;
+        refreshVariables(); model.fireTableDataChanged();
+        status.setText(removed == 0 ? "Variable not found." : "Variable {{" + name + "}} deleted.");
+    }
+    private void editVariable() {
+        String name = (String) variableBox.getSelectedItem();
+        if (name == null || name.isBlank()) { error("Select a variable first"); return; }
+        for (ChainStep step : steps) {
+            if (step.outputs.containsKey(name)) {
+                parameterNameDefault = name;
+                createVariable(step, selectedText(responseEditor));
+                parameterNameDefault = "id";
+                return;
+            }
+        }
+        error("Variable not found");
+    }
+    private String b64(String value) { return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8)); }
+    private String unb64(String value) { return new String(java.util.Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8); }
+    private void saveChain() {
+        JFileChooser chooser = new JFileChooser();
+        if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        try (java.io.BufferedWriter out = java.nio.file.Files.newBufferedWriter(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8)) {
+            saveSelected(); out.write("REQUESTS-CHAIN-1\n");
+            for (ChainStep step : steps) {
+                out.write("S\t" + b64(step.service.host()) + "\t" + step.service.port() + "\t" + step.service.secure() + "\t" + b64(step.requestTemplate) + "\n");
+                for (Map.Entry<String, String> output : step.outputs.entrySet()) out.write("V\t" + b64(output.getKey()) + "\t" + b64(output.getValue()) + "\n");
+                out.write("E\n");
+            }
+            status.setText("Chain saved: " + chooser.getSelectedFile().getName());
+        } catch (Exception ex) { error("Cannot save chain: " + ex.getMessage()); }
+    }
+    private void loadChain() {
+        JFileChooser chooser = new JFileChooser();
+        if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        try {
+            List<String> lines = java.nio.file.Files.readAllLines(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8);
+            if (lines.isEmpty() || !lines.get(0).equals("REQUESTS-CHAIN-1")) throw new IOException("Invalid chain file");
+            List<ChainStep> loaded = new ArrayList<>(); ChainStep current = null;
+            for (String line : lines.subList(1, lines.size())) {
+                String[] parts = line.split("\\t", -1);
+                if (parts[0].equals("S")) {
+                    HttpService service = HttpService.httpService(unb64(parts[1]), Integer.parseInt(parts[2]), Boolean.parseBoolean(parts[3]));
+                    current = new ChainStep(service, unb64(parts[4])); loaded.add(current);
+                } else if (parts[0].equals("V") && current != null) current.outputs.put(unb64(parts[1]), unb64(parts[2]));
+            }
+            steps.clear(); steps.addAll(loaded); model.fireTableDataChanged(); refreshVariables();
+            if (!steps.isEmpty()) table.setRowSelectionInterval(0, 0);
+            status.setText("Chain loaded: " + chooser.getSelectedFile().getName());
+        } catch (Exception ex) { error("Cannot load chain: " + ex.getMessage()); }
     }
     private void removeSelected() {
         int[] selected = table.getSelectedRows();

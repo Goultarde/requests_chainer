@@ -2,6 +2,7 @@ package com.example.burpchain;
 
 import burp.api.montoya.http.HttpService;
 import burp.api.montoya.http.message.HttpRequestResponse;
+import burp.api.montoya.http.message.requests.HttpRequest;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
@@ -21,5 +22,11 @@ final class ChainStep {
             lastResponse = item.response().toString();
             lastResponseBody = item.response().bodyToString();
         }
+    }
+
+    ChainStep(HttpService service, String requestTemplate) {
+        this.service = service;
+        this.url = HttpRequest.httpRequest(service, requestTemplate).url();
+        this.requestTemplate = requestTemplate;
     }
 }
