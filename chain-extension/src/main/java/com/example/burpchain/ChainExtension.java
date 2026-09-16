@@ -105,6 +105,8 @@ public final class ChainExtension implements BurpExtension {
         JButton loadChain = new JButton("Load chain");
         JButton deleteVariable = new JButton("Delete variable");
         JButton editVariable = new JButton("Edit variable");
+        JButton replaceAll = new JButton("Replace in all requests");
+        JButton propagateHeader = new JButton("Use variable in all headers");
         variable.setBackground(new Color(0x2F75B5));
         variable.setForeground(Color.WHITE);
         variable.setOpaque(true);
@@ -115,6 +117,8 @@ public final class ChainExtension implements BurpExtension {
         buttons.add(run); buttons.add(clear); buttons.add(up); buttons.add(down); buttons.add(remove);
         buttons.add(save); buttons.add(variable); buttons.add(insert); buttons.add(intruder);
         buttons.add(saveChain); buttons.add(loadChain); buttons.add(deleteVariable); buttons.add(editVariable);
+        buttons.add(replaceAll);
+        buttons.add(propagateHeader);
         run.setBackground(new Color(0xE8752A));
         run.setForeground(Color.WHITE);
         run.setOpaque(true);
@@ -179,6 +183,8 @@ public final class ChainExtension implements BurpExtension {
         loadChain.addActionListener(e -> loadChain());
         deleteVariable.addActionListener(e -> deleteVariable());
         editVariable.addActionListener(e -> editVariable());
+        replaceAll.addActionListener(e -> replaceAcrossRequests());
+        propagateHeader.addActionListener(e -> propagateVariableHeader());
         run.addActionListener(e -> runChain());
         clear.addActionListener(e -> { steps.clear(); model.fireTableDataChanged(); showSelected(); log.setText(""); status.setText("Chain cleared. Add requests from Proxy history."); });
         variableSearch.getDocument().addDocumentListener(new DocumentListener() {
@@ -260,9 +266,11 @@ public final class ChainExtension implements BurpExtension {
         }
         String selector = parameterSelector;
         try {
+            int selectedRow = steps.indexOf(step);
             step.outputs.put(name, selector);
             refreshVariables();
             model.fireTableDataChanged();
+            if (selectedRow >= 0 && selectedRow < steps.size()) table.setRowSelectionInterval(selectedRow, selectedRow);
             status.setText("Variable {{" + name + "}} configured for step " + (steps.indexOf(step) + 1));
         } catch (Exception ex) { error("Could not parse JSON response: " + ex.getMessage()); }
     }
@@ -429,11 +437,16 @@ public final class ChainExtension implements BurpExtension {
         String current = requestEditor.getRequest().toString();
         String replacement = "{{" + name + "}}";
         String updated;
-        java.util.Optional<String> selectedRequest = requestEditor.selection().map(s -> s.contents().toString());
-        if (selectedRequest.isPresent() && !selectedRequest.get().isEmpty()) {
-            int start = current.indexOf(selectedRequest.get());
-            updated = start < 0 ? current : current.substring(0, start) + replacement
-                    + current.substring(start + selectedRequest.get().length());
+        java.util.Optional<burp.api.montoya.ui.Selection> selectedRequest = requestEditor.selection();
+        if (selectedRequest.isPresent() && selectedRequest.get().offsets().startIndexInclusive() < selectedRequest.get().offsets().endIndexExclusive()) {
+            byte[] original = requestEditor.getRequest().toByteArray().getBytes();
+            burp.api.montoya.core.Range range = selectedRequest.get().offsets();
+            byte[] replacementBytes = replacement.getBytes(StandardCharsets.UTF_8);
+            byte[] result = new byte[original.length - (range.endIndexExclusive() - range.startIndexInclusive()) + replacementBytes.length];
+            System.arraycopy(original, 0, result, 0, range.startIndexInclusive());
+            System.arraycopy(replacementBytes, 0, result, range.startIndexInclusive(), replacementBytes.length);
+            System.arraycopy(original, range.endIndexExclusive(), result, range.startIndexInclusive() + replacementBytes.length, original.length - range.endIndexExclusive());
+            updated = new String(result, StandardCharsets.UTF_8);
         } else {
             int caret = requestEditor.caretPosition();
             updated = current.substring(0, caret) + replacement + current.substring(caret);
@@ -508,6 +521,42 @@ public final class ChainExtension implements BurpExtension {
         }
         error("Variable not found");
     }
+    private void replaceAcrossRequests() {
+        JPanel panel = new JPanel(new java.awt.GridLayout(2, 2, 6, 6));
+        JTextField search = new JTextField();
+        JTextField replacement = new JTextField();
+        panel.add(new JLabel("Search:")); panel.add(search);
+        panel.add(new JLabel("Replace with:")); panel.add(replacement);
+        int result = JOptionPane.showConfirmDialog(null, panel, "Replace in all requests", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+        if (result != JOptionPane.OK_OPTION || search.getText().isEmpty()) return;
+        saveSelected();
+        int changed = 0;
+        for (ChainStep step : steps) {
+            String updated = step.requestTemplate.replace(search.getText(), replacement.getText());
+            if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
+        }
+        model.fireTableDataChanged();
+        showSelected();
+        status.setText("Replaced '" + search.getText() + "' in " + changed + " request(s).");
+    }
+    private void propagateVariableHeader() {
+        String variable = (String) variableBox.getSelectedItem();
+        if (variable == null || variable.isBlank()) { error("Select a variable first"); return; }
+        JPanel panel = new JPanel(new java.awt.GridLayout(1, 2, 6, 6));
+        JTextField header = new JTextField("Authorization");
+        panel.add(new JLabel("Header name:")); panel.add(header);
+        if (JOptionPane.showConfirmDialog(null, panel, "Use variable in all headers", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE) != JOptionPane.OK_OPTION) return;
+        if (!header.getText().matches("[A-Za-z0-9-]+")) { error("Invalid header name"); return; }
+        saveSelected();
+        java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("(?im)^(" + java.util.regex.Pattern.quote(header.getText()) + "\\s*:\\s*)[^\\r\\n]+$");
+        int changed = 0;
+        for (ChainStep step : steps) {
+            String updated = pattern.matcher(step.requestTemplate).replaceAll("$1{{" + java.util.regex.Matcher.quoteReplacement(variable) + "}}");
+            if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
+        }
+        model.fireTableDataChanged(); showSelected();
+        status.setText("Header " + header.getText() + " now uses {{" + variable + "}} in " + changed + " request(s).");
+    }
     private String b64(String value) { return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8)); }
     private String unb64(String value) { return new String(java.util.Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8); }
     private void saveChain() {
@@ -555,7 +604,7 @@ public final class ChainExtension implements BurpExtension {
         if (running) { error("A chain is already running"); return; }
         if (steps.isEmpty()) {
             status.setText("Nothing to run: add at least one request from Proxy history.");
-            log.append("Run chain ignored: the chain is empty.\n");
+            appendLog("Run chain ignored: the chain is empty.");
             log.setCaretPosition(log.getDocument().getLength());
             return;
         }
@@ -563,7 +612,7 @@ public final class ChainExtension implements BurpExtension {
         List<ChainStep> snapshot = List.copyOf(steps);
         int repetitions = ((Number) repetitionCount.getValue()).intValue();
         running = true;
-        log.append("Starting " + repetitions + " run(s), " + snapshot.size() + " step(s) each...\n");
+        appendLog("Starting " + repetitions + " run(s), " + snapshot.size() + " step(s) each...");
         log.setCaretPosition(log.getDocument().getLength());
         status.setText("Running " + snapshot.size() + " request(s)...");
         new SwingWorker<Void, String>() {
@@ -587,7 +636,7 @@ public final class ChainExtension implements BurpExtension {
                 return null;
             }
             @Override protected void process(List<String> messages) {
-                for (String message : messages) log.append(message + "\n");
+                for (String message : messages) appendLog(message);
                 showSelected();
             }
             @Override protected void done() {
@@ -596,7 +645,7 @@ public final class ChainExtension implements BurpExtension {
                 catch (Exception ex) {
                     Throwable cause = ex.getCause() == null ? ex : ex.getCause();
                     status.setText("Chain stopped: " + cause.getMessage());
-                    log.append(status.getText() + "\n");
+                    appendLog(status.getText());
                 }
             }
         }.execute();
@@ -615,7 +664,7 @@ public final class ChainExtension implements BurpExtension {
             saveSelected();
             List<ChainStep> snapshot = List.copyOf(steps);
             running = true;
-            log.append("Starting wordlist run: " + payloads.size() + " payload(s), target step " + (target + 1) + "\n");
+            appendLog("Starting wordlist run: " + payloads.size() + " payload(s), target step " + (target + 1));
             new SwingWorker<Void, String>() {
                 @Override protected Void doInBackground() throws Exception {
                     for (int n = 0; n < payloads.size(); n++) {
@@ -638,7 +687,7 @@ public final class ChainExtension implements BurpExtension {
                     }
                     return null;
                 }
-                @Override protected void process(List<String> messages) { for (String message : messages) log.append(message + "\n"); }
+                @Override protected void process(List<String> messages) { for (String message : messages) appendLog(message); }
                 @Override protected void done() { running = false; try { get(); status.setText("Wordlist run finished."); } catch (Exception ex) { status.setText("Wordlist run stopped: " + ex.getCause()); } }
             }.execute();
         } catch (Exception ex) { error("Cannot read wordlist: " + ex.getMessage()); }
@@ -673,7 +722,7 @@ public final class ChainExtension implements BurpExtension {
                     step.lastResponse = result.response().toString();
                     step.lastResponseBody = result.response().bodyToString();
                     return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
-                }, message -> log.append("Intruder chain: " + message + "\n"));
+                }, message -> appendLog("Intruder chain: " + message));
                 return RequestToBeSentAction.continueWith(HttpRequest.httpRequest(request.httpService(),
                         Template.renderHttpRequest(request.toString(), variables)));
             } catch (Exception ex) {
@@ -694,6 +743,11 @@ public final class ChainExtension implements BurpExtension {
         throw new IllegalArgumentException("Mark the target value with {{WORDLIST}} or §value§");
     }
 
+    private void appendLog(String message) {
+        String time = java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
+        log.append("[" + time + "] " + message + "\n");
+        log.setCaretPosition(log.getDocument().getLength());
+    }
     private void error(String message) { JOptionPane.showMessageDialog(null, message, "Requests Chainer", JOptionPane.ERROR_MESSAGE); }
 
     /** FlowLayout whose preferred height follows the available width instead of clipping buttons. */
