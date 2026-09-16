@@ -5,6 +5,12 @@ out/
 *.jar
 *.war
 *.ear
+!chain-extension/gradle/wrapper/gradle-wrapper.jar
+!chain-extension/build/
+chain-extension/build/*
+!chain-extension/build/libs/
+chain-extension/build/libs/*
+!chain-extension/build/libs/burp-request-chain.jar
 
 .idea/
 *.iml
