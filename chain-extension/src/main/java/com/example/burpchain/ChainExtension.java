@@ -11,6 +11,9 @@ import burp.api.montoya.http.handler.HttpHandler;
 import burp.api.montoya.http.handler.HttpRequestToBeSent;
 import burp.api.montoya.http.handler.RequestToBeSentAction;
 import burp.api.montoya.http.handler.ResponseReceivedAction;
+import burp.api.montoya.http.sessions.ActionResult;
+import burp.api.montoya.http.sessions.SessionHandlingAction;
+import burp.api.montoya.http.sessions.SessionHandlingActionData;
 import burp.api.montoya.ui.contextmenu.ContextMenuEvent;
 import burp.api.montoya.ui.contextmenu.ContextMenuItemsProvider;
 import burp.api.montoya.ui.contextmenu.MessageEditorHttpRequestResponse;
@@ -91,7 +94,7 @@ public final class ChainExtension implements BurpExtension {
         suiteTab = buildPanel();
         api.userInterface().registerSuiteTab("Requests Chainer", suiteTab);
         api.userInterface().registerContextMenuItemsProvider(new Menu());
-        api.http().registerHttpHandler(new IntruderChainHandler());
+        api.http().registerSessionHandlingAction(new ChainSessionAction());
     }
 
     private Component buildPanel() {
@@ -574,6 +577,7 @@ public final class ChainExtension implements BurpExtension {
             if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
         }
         model.fireTableDataChanged();
+        displayedStep = null;
         showSelected();
         status.setText("Replaced '" + search.getText() + "' in " + changed + " request(s).");
     }
@@ -592,7 +596,7 @@ public final class ChainExtension implements BurpExtension {
             String updated = pattern.matcher(step.requestTemplate).replaceAll("$1{{" + java.util.regex.Matcher.quoteReplacement(variable) + "}}");
             if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
         }
-        model.fireTableDataChanged(); showSelected();
+        model.fireTableDataChanged(); displayedStep = null; showSelected();
         status.setText("Header " + header.getText() + " now uses {{" + variable + "}} in " + changed + " request(s).");
     }
     private String b64(String value) { return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8)); }
@@ -752,8 +756,33 @@ public final class ChainExtension implements BurpExtension {
             intruderTargetIndex = steps.indexOf(step);
             intruderChainEnabled = intruderTargetIndex > 0;
             api.intruder().sendToIntruder(HttpRequest.httpRequest(step.service, step.requestTemplate), "Requests Chainer");
-            status.setText("Target sent to Intruder. The " + intruderTargetIndex + " preceding chain step(s) run before each Intruder request.");
+            status.setText("Target sent. Add 'Requests Chainer - run preceding chain' to a Burp Session handling rule for Intruder.");
         } catch (Exception ex) { error("Cannot send request to Intruder: " + ex.getMessage()); }
+    }
+
+    private final class ChainSessionAction implements SessionHandlingAction {
+        @Override public String name() { return "Requests Chainer - run preceding chain"; }
+        @Override public ActionResult performAction(SessionHandlingActionData data) {
+            if (!intruderChainEnabled || intruderTargetUrl == null || !intruderTargetUrl.equals(data.request().url()))
+                return ActionResult.actionResult(data.request());
+            try {
+                List<ChainStep> before = List.copyOf(steps.subList(0, intruderTargetIndex));
+                List<ChainEngine.Step> definitions = before.stream().map(s -> new ChainEngine.Step(s.requestTemplate, Map.copyOf(s.outputs))).toList();
+                Map<String, String> variables = ChainEngine.run(definitions, (index, raw) -> {
+                    ChainStep step = before.get(index);
+                    HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
+                    if (!result.hasResponse()) return null;
+                    step.lastResponse = result.response().toString();
+                    step.lastResponseBody = result.response().bodyToString();
+                    return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
+                }, message -> appendLog("Session chain: " + message));
+                return ActionResult.actionResult(HttpRequest.httpRequest(data.request().httpService(),
+                        Template.renderHttpRequest(data.request().toString(), variables)));
+            } catch (Exception ex) {
+                api.logging().logToError("Session chain failed: " + ex.getMessage());
+                return ActionResult.actionResult(data.request());
+            }
+        }
     }
 
     private final class IntruderChainHandler implements HttpHandler {
