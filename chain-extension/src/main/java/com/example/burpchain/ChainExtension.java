@@ -26,6 +26,7 @@ import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.FlowLayout;
 import java.awt.Color;
+import java.awt.Font;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
 import java.io.IOException;
@@ -65,6 +66,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JFileChooser;
 import javax.swing.JSplitPane;
 import javax.swing.JTable;
+import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.table.AbstractTableModel;
@@ -84,7 +86,7 @@ public final class ChainExtension implements BurpExtension {
     private final JTable table = new JTable(model);
     private HttpRequestEditor requestEditor;
     private HttpResponseEditor responseEditor;
-    private final javax.swing.JTextArea log = new javax.swing.JTextArea(5, 80);
+    private final JTextPane log = new JTextPane();
     private final JLabel status = new JLabel("Select requests in Proxy history, then right-click > Add to Requests Chainer.");
     private volatile boolean running;
     private ChainStep displayedStep;
@@ -93,6 +95,10 @@ public final class ChainExtension implements BurpExtension {
     private final JTextField variableSearch = new JTextField(12);
     private final JSpinner repetitionCount = new JSpinner(new SpinnerNumberModel(1, 1, 1000, 1));
     private final Deque<String> requestUndo = new ArrayDeque<>();
+    private java.io.File lastChainDirectory;
+    private final TabActivityIndicator tabActivity = new TabActivityIndicator();
+    private javax.swing.Timer trafficTimer;
+    private boolean tabIndicatorFailureLogged;
 
     @Override public void initialize(MontoyaApi api) {
         this.api = api;
@@ -105,9 +111,8 @@ public final class ChainExtension implements BurpExtension {
 
     private Component buildPanel() {
         JPanel root = new JPanel(new BorderLayout(6, 6));
-        root.setMinimumSize(new java.awt.Dimension(900, 600));
+        root.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
         root.setPreferredSize(new java.awt.Dimension(1200, 800));
-        JPanel buttons = new JPanel(new WrapLayout(FlowLayout.LEFT, 5, 2));
         JButton up = new JButton("Move up");
         JButton down = new JButton("Move down");
         JButton remove = new JButton("Remove");
@@ -115,51 +120,42 @@ public final class ChainExtension implements BurpExtension {
         JButton variable = new JButton("Variable from response selection");
         JButton insert = new JButton("Insert variable");
         JButton intruder = new JButton("Send target to Intruder");
-        JButton sessionRule = new JButton("Configure Intruder session rule");
-        JButton saveChain = new JButton("Save chain");
-        JButton loadChain = new JButton("Load chain");
+        JButton repeater = new JButton("Send to Repeater");
+        JButton sessionRule = new JButton("⚙ Configure Intruder session rule");
+        JButton saveChain = new JButton("Save chains");
+        JButton loadChain = new JButton("Load chains");
         JButton deleteVariable = new JButton("Delete variable");
         JButton editVariable = new JButton("Edit variable");
         JButton replaceAll = new JButton("Replace in all requests");
         JButton propagateHeader = new JButton("Use variable in all headers");
         JButton newChain = new JButton("New chain");
-        variable.setBackground(new Color(0x2F75B5));
-        variable.setForeground(Color.WHITE);
-        variable.setOpaque(true);
-        variable.setBorderPainted(false);
         JButton run = new JButton("Run chain");
-        run.setToolTipText("Execute the requests in the table in order");
         JButton clear = new JButton("Clear chain");
-        buttons.add(run); buttons.add(clear); buttons.add(up); buttons.add(down); buttons.add(remove);
-        buttons.add(save); buttons.add(variable); buttons.add(insert); buttons.add(intruder); buttons.add(sessionRule);
-        buttons.add(saveChain); buttons.add(loadChain); buttons.add(deleteVariable); buttons.add(editVariable);
-        buttons.add(replaceAll);
-        buttons.add(propagateHeader);
         chainSelector.addItem(currentChainName);
-        run.setBackground(new Color(0xE8752A));
-        run.setForeground(Color.WHITE);
-        run.setOpaque(true);
-        run.setBorderPainted(false);
-        JPanel variableBar = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        variableBar.add(new JLabel("Select the variable to insert:"));
-        variableBar.add(variableSearch);
-        variableBar.add(variableBox);
-        variableBar.add(new JLabel("Select the number of chain runs:"));
-        variableBar.add(new JLabel("Runs:"));
+        stylePrimaryButton(run, new Color(0xD96A1D));
+        stylePrimaryButton(variable, new Color(0x286EAC));
+        run.setToolTipText("Execute all requests in order (Ctrl+Alt+R)");
+        intruder.setToolTipText("Use the selected request as the Intruder target (Ctrl+I)");
+        repeater.setToolTipText("Open the selected request(s) in Burp Repeater (Ctrl+R)");
+        variable.setToolTipText("Select a value in the response editor to create a reusable variable");
+        variableSearch.setToolTipText("Filter the variable list");
+        variableBox.setToolTipText("Select a variable to insert or manage");
+        chainSelector.setToolTipText("Choose the chain to edit");
+        chainSelector.setPrototypeDisplayValue("A chain with a long name");
+        variableBox.setPrototypeDisplayValue("A long variable name");
         repetitionCount.setToolTipText("Number of complete chain executions (1-1000)");
-        variableBar.add(repetitionCount);
-        variableBar.add(new JLabel("Chain:"));
-        variableBar.add(chainSelector);
-        variableBar.add(newChain);
+
         JPanel top = new JPanel();
         top.setLayout(new javax.swing.BoxLayout(top, javax.swing.BoxLayout.Y_AXIS));
-        buttons.setAlignmentX(Component.LEFT_ALIGNMENT);
-        variableBar.setAlignmentX(Component.LEFT_ALIGNMENT);
-        top.add(buttons);
-        top.add(variableBar);
+        Color separator = javax.swing.UIManager.getColor("Separator.foreground");
+        top.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0,
+                separator != null ? separator : Color.GRAY));
+        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain));
+        top.add(toolbarRow("RUN", run, new JLabel("Runs:"), repetitionCount, clear, intruder, repeater, sessionRule));
+        top.add(toolbarRow("VARIABLES", new JLabel("Find:"), variableSearch, variableBox, insert, variable, editVariable, deleteVariable));
+        top.add(toolbarRow("EDIT", save, replaceAll, propagateHeader));
         root.addComponentListener(new java.awt.event.ComponentAdapter() {
             @Override public void componentResized(java.awt.event.ComponentEvent e) {
-                buttons.revalidate();
                 top.revalidate();
                 root.revalidate();
             }
@@ -168,23 +164,67 @@ public final class ChainExtension implements BurpExtension {
         requestEditor = api.userInterface().createHttpRequestEditor();
         responseEditor = api.userInterface().createHttpResponseEditor();
         log.setEditable(false);
+        log.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        log.setMargin(new java.awt.Insets(7, 9, 7, 9));
+        table.setRowHeight(Math.max(26, table.getRowHeight()));
+        table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+        table.setFillsViewportHeight(true);
+        table.getColumnModel().getColumn(0).setPreferredWidth(55);
+        table.getColumnModel().getColumn(0).setMaxWidth(80);
+        table.getColumnModel().getColumn(1).setPreferredWidth(600);
+        table.getColumnModel().getColumn(2).setPreferredWidth(250);
+        JPanel stepsPanel = new JPanel(new BorderLayout(4, 4));
+        JPanel stepsHeader = new JPanel(new BorderLayout());
+        stepsHeader.add(sectionTitle("Chain steps"), BorderLayout.WEST);
+        JPanel stepActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        stepActions.add(up); stepActions.add(down); stepActions.add(remove);
+        stepsHeader.add(stepActions, BorderLayout.EAST);
+        stepsPanel.add(stepsHeader, BorderLayout.NORTH);
+        stepsPanel.add(new JScrollPane(table), BorderLayout.CENTER);
         // Montoya's native editors provide their own scrolling and syntax coloring.
         JSplitPane editors = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT,
-                requestEditor.uiComponent(), responseEditor.uiComponent());
+                editorPanel("Request · editable", requestEditor.uiComponent()),
+                editorPanel("Response · select a value to create a variable", responseEditor.uiComponent()));
         editors.setResizeWeight(0.5);
-        JSplitPane main = new JSplitPane(JSplitPane.VERTICAL_SPLIT, new JScrollPane(table), editors);
-        main.setResizeWeight(0.25);
+        JSplitPane main = new JSplitPane(JSplitPane.VERTICAL_SPLIT, stepsPanel, editors);
+        main.setResizeWeight(0.3);
         JPanel bottom = new JPanel(new BorderLayout());
-        bottom.add(status, BorderLayout.NORTH);
+        JPanel logHeader = new JPanel(new BorderLayout(6, 2));
+        logHeader.add(sectionTitle("Activity log"), BorderLayout.WEST);
+        status.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 0));
+        JButton copyLog = new JButton("Copy");
+        copyLog.setToolTipText("Copy the activity log to the clipboard");
+        copyLog.addActionListener(e -> {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(
+                    new StringSelection(log.getText()), null);
+            status.setText("Activity log copied.");
+        });
+        JButton clearLog = new JButton("Clear log");
+        clearLog.addActionListener(e -> log.setText(""));
+        JPanel logActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        logActions.add(copyLog);
+        logActions.add(clearLog);
+        logHeader.add(logActions, BorderLayout.EAST);
+        JPanel logTop = new JPanel(new BorderLayout());
+        logTop.add(logHeader, BorderLayout.NORTH);
+        logTop.add(status, BorderLayout.SOUTH);
+        bottom.add(logTop, BorderLayout.NORTH);
         bottom.add(new JScrollPane(log), BorderLayout.CENTER);
         JSplitPane content = new JSplitPane(JSplitPane.VERTICAL_SPLIT, main, bottom);
-        content.setResizeWeight(0.82);
+        content.setResizeWeight(0.8);
         content.setOneTouchExpandable(true);
+        content.setDividerSize(7);
+        main.setDividerSize(7);
+        editors.setDividerSize(7);
         root.add(content, BorderLayout.CENTER);
         root.setFocusable(true);
-        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control R"), "requests-chainer-run");
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control alt R"), "requests-chainer-run");
         root.getActionMap().put("requests-chainer-run", new AbstractAction() {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { runChain(); }
+        });
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control R"), "requests-chainer-repeater");
+        root.getActionMap().put("requests-chainer-repeater", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { sendSelectedToRepeater(); }
         });
         root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke("control I"), "requests-chainer-intruder");
         root.getActionMap().put("requests-chainer-intruder", new AbstractAction() {
@@ -195,7 +235,8 @@ public final class ChainExtension implements BurpExtension {
             @Override public void actionPerformed(java.awt.event.ActionEvent event) { undoRequestEdit(); }
         });
         table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
-        table.setCellSelectionEnabled(true);
+        table.setRowSelectionAllowed(true);
+        table.setColumnSelectionAllowed(false);
         table.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mousePressed(java.awt.event.MouseEvent e) { showTablePopup(e); }
             @Override public void mouseReleased(java.awt.event.MouseEvent e) { showTablePopup(e); }
@@ -207,6 +248,7 @@ public final class ChainExtension implements BurpExtension {
         variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor)));
         insert.addActionListener(e -> insertVariable());
         intruder.addActionListener(e -> sendTargetToIntruder());
+        repeater.addActionListener(e -> sendSelectedToRepeater());
         sessionRule.addActionListener(e -> showSessionRuleInstructions());
         saveChain.addActionListener(e -> saveChain());
         loadChain.addActionListener(e -> loadChain());
@@ -217,7 +259,11 @@ public final class ChainExtension implements BurpExtension {
         replaceAll.addActionListener(e -> replaceAcrossRequests());
         propagateHeader.addActionListener(e -> propagateVariableHeader());
         run.addActionListener(e -> runChain());
-        clear.addActionListener(e -> { steps.clear(); model.fireTableDataChanged(); showSelected(); log.setText(""); status.setText("Chain cleared. Add requests from Proxy history."); });
+        clear.addActionListener(e -> {
+            steps.clear(); model.fireTableDataChanged(); showSelected();
+            status.setText("Chain cleared. Add requests from Proxy history.");
+            appendLog(LogLevel.INFO, "CHAIN", "Chain cleared");
+        });
         variableSearch.getDocument().addDocumentListener(new DocumentListener() {
             public void insertUpdate(DocumentEvent e) { refreshVariables(); }
             public void removeUpdate(DocumentEvent e) { refreshVariables(); }
@@ -226,12 +272,90 @@ public final class ChainExtension implements BurpExtension {
         return root;
     }
 
+    private JPanel toolbarRow(String title, Component... controls) {
+        JPanel row = new JPanel(new WrapLayout(FlowLayout.LEFT, 6, 3));
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setBorder(BorderFactory.createEmptyBorder(2, 2, 2, 2));
+        JLabel label = new JLabel(title);
+        label.setFont(label.getFont().deriveFont(Font.BOLD, 11f));
+        Color muted = javax.swing.UIManager.getColor("Label.disabledForeground");
+        label.setForeground(muted != null ? muted : Color.GRAY);
+        label.setPreferredSize(new java.awt.Dimension(76, label.getPreferredSize().height));
+        row.add(label);
+        for (Component control : controls) row.add(control);
+        return row;
+    }
+
+    private JLabel sectionTitle(String title) {
+        JLabel label = new JLabel(title);
+        label.setFont(label.getFont().deriveFont(Font.BOLD));
+        label.setBorder(BorderFactory.createEmptyBorder(3, 5, 3, 5));
+        return label;
+    }
+
+    private JPanel editorPanel(String title, Component editor) {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.add(sectionTitle(title), BorderLayout.NORTH);
+        panel.add(editor, BorderLayout.CENTER);
+        return panel;
+    }
+
+    private void stylePrimaryButton(JButton button, Color background) {
+        button.setBackground(background);
+        button.setForeground(Color.WHITE);
+        button.setOpaque(true);
+        button.setBorderPainted(false);
+        button.setBorder(BorderFactory.createEmptyBorder(6, 12, 6, 12));
+    }
+
+    private void markTraffic() {
+        SwingUtilities.invokeLater(() -> {
+            if (trafficTimer != null && trafficTimer.isRunning()) return;
+            long started = System.nanoTime();
+            trafficTimer = new javax.swing.Timer(40, e -> {
+                long elapsed = (System.nanoTime() - started) / 1_000_000;
+                if (elapsed >= 1800) {
+                    trafficTimer.stop();
+                    setTabTraffic(0f);
+                } else {
+                    setTabTraffic(activityOpacity(elapsed));
+                }
+            });
+            trafficTimer.setRepeats(true);
+            trafficTimer.start();
+        });
+    }
+
+    private static float activityOpacity(long elapsedMillis) {
+        long phase = elapsedMillis % 900;
+        if (phase < 160) return phase / 160f;
+        if (phase < 420) return 1f;
+        if (phase < 600) return 1f - (phase - 420) / 180f;
+        return 0f;
+    }
+
+    private void setTabTraffic(float opacity) {
+        if (!tabActivity.show(suiteTab, opacity) && opacity > 0f && !tabIndicatorFailureLogged) {
+            tabIndicatorFailureLogged = true;
+            api.logging().logToError("Requests Chainer: could not locate Burp's tab header to show the activity dot.");
+        }
+    }
+
     private void showTablePopup(java.awt.event.MouseEvent event) {
         if (!event.isPopupTrigger()) return;
         int row = table.rowAtPoint(event.getPoint());
         if (row >= 0 && !table.isRowSelected(row)) table.setRowSelectionInterval(row, row);
         if (table.getSelectedRowCount() == 0) return;
         JPopupMenu popup = new JPopupMenu();
+        JMenuItem sendRepeater = new JMenuItem("Send to Repeater");
+        sendRepeater.addActionListener(e -> sendSelectedToRepeater());
+        popup.add(sendRepeater);
+        if (table.getSelectedRowCount() == 1) {
+            JMenuItem sendIntruder = new JMenuItem("Send target to Intruder");
+            sendIntruder.addActionListener(e -> sendTargetToIntruder());
+            popup.add(sendIntruder);
+        }
+        popup.addSeparator();
         JMenuItem scan = new JMenuItem("Start active scan");
         scan.addActionListener(e -> startActiveScanForSelection());
         popup.add(scan);
@@ -290,6 +414,51 @@ public final class ChainExtension implements BurpExtension {
         dialog.setVisible(true);
     }
 
+    private void showSetupAssistant() {
+        JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(suiteTab),
+                "Setup Requests Chainer", java.awt.Dialog.ModalityType.APPLICATION_MODAL);
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
+
+        boolean chainReady = steps.size() >= 2;
+        boolean targetReady = intruderChainEnabled && intruderTargetUrl != null;
+        String actionName = "Requests Chainer - run preceding chain";
+        JTextArea state = new JTextArea(
+                "Requests Chainer setup\n\n"
+                + "Extension action:       ✓ Registered\n"
+                + "Chain (2+ requests):    " + (chainReady ? "✓ Ready" : "✗ Add at least 2 requests") + "\n"
+                + "Intruder target:        " + (targetReady ? "✓ Configured" : "✗ Not configured") + "\n"
+                + "Session handling rule:  ? Burp must be configured manually\n\n"
+                + "Next steps\n"
+                + "1. Create a Session handling rule in Burp.\n"
+                + "2. Add the action: Invoke a Burp extension.\n"
+                + "3. Select: " + actionName + "\n"
+                + "4. Set the scope and enable the rule.\n"
+                + "5. Use Send target to Intruder, then start your attack.\n\n"
+                + "The Test configuration button copies the action name and records a reminder in the log.");
+        state.setEditable(false);
+        state.setOpaque(false);
+        state.setFont(new java.awt.Font(java.awt.Font.MONOSPACED, java.awt.Font.PLAIN, 12));
+        panel.add(state, BorderLayout.CENTER);
+
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton test = new JButton("Test configuration");
+        test.addActionListener(e -> {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(actionName), null);
+            appendLog("Setup test: action name copied. Trigger an Intruder request to verify the Session handling rule.");
+            status.setText("Setup test prepared. Run one Intruder request and check the log.");
+        });
+        JButton close = new JButton("Close");
+        close.addActionListener(e -> dialog.dispose());
+        actions.add(test);
+        actions.add(close);
+        panel.add(actions, BorderLayout.SOUTH);
+        dialog.setContentPane(panel);
+        dialog.setSize(680, 470);
+        dialog.setLocationRelativeTo(suiteTab);
+        dialog.setVisible(true);
+    }
+
     private final class Menu implements ContextMenuItemsProvider {
         @Override public List<Component> provideMenuItems(ContextMenuEvent event) {
             List<Component> menu = new ArrayList<>();
@@ -321,6 +490,7 @@ public final class ChainExtension implements BurpExtension {
         model.fireTableDataChanged();
         if (!steps.isEmpty()) table.setRowSelectionInterval(steps.size() - 1, steps.size() - 1);
         status.setText(steps.size() + " request(s) in chain. Use Move up/down to set execution order.");
+        if (items.stream().anyMatch(item -> item.request() != null)) markTraffic();
     }
 
     private void storeCurrentChain() {
@@ -683,8 +853,16 @@ public final class ChainExtension implements BurpExtension {
     private String unb64(String value) { return new String(java.util.Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8); }
     private void saveChain() {
         JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Save Requests Chainer chains");
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Requests Chainer files (*.rchain)", "rchain"));
+        if (lastChainDirectory != null) chooser.setCurrentDirectory(lastChainDirectory);
+        chooser.setSelectedFile(new java.io.File(currentChainName.replaceAll("[^A-Za-z0-9._-]", "_") + ".rchain"));
         if (chooser.showSaveDialog(null) != JFileChooser.APPROVE_OPTION) return;
-        try (java.io.BufferedWriter out = java.nio.file.Files.newBufferedWriter(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8)) {
+        java.io.File selectedFile = chooser.getSelectedFile();
+        if (!selectedFile.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".rchain"))
+            selectedFile = new java.io.File(selectedFile.getParentFile(), selectedFile.getName() + ".rchain");
+        lastChainDirectory = selectedFile.getParentFile();
+        try (java.io.BufferedWriter out = java.nio.file.Files.newBufferedWriter(selectedFile.toPath(), StandardCharsets.UTF_8)) {
             storeCurrentChain(); out.write("REQUESTS-CHAINS-1\n");
             for (Map.Entry<String, List<ChainStep>> chain : namedChains.entrySet()) {
                 out.write("C\t" + b64(chain.getKey()) + "\n");
@@ -694,12 +872,16 @@ public final class ChainExtension implements BurpExtension {
                 out.write("E\n");
                 }
             }
-            status.setText("Chain saved: " + chooser.getSelectedFile().getName());
+            status.setText("Chains saved: " + selectedFile.getName());
         } catch (Exception ex) { error("Cannot save chain: " + ex.getMessage()); }
     }
     private void loadChain() {
         JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Load Requests Chainer chains");
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Requests Chainer files (*.rchain, legacy)", "rchain", "chain"));
+        if (lastChainDirectory != null) chooser.setCurrentDirectory(lastChainDirectory);
         if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
+        lastChainDirectory = chooser.getSelectedFile().getParentFile();
         try {
             List<String> lines = java.nio.file.Files.readAllLines(chooser.getSelectedFile().toPath(), StandardCharsets.UTF_8);
             if (lines.isEmpty() || !(lines.get(0).equals("REQUESTS-CHAINS-1") || lines.get(0).equals("REQUESTS-CHAIN-1"))) throw new IOException("Invalid chain file");
@@ -738,48 +920,67 @@ public final class ChainExtension implements BurpExtension {
         if (running) { error("A chain is already running"); return; }
         if (steps.isEmpty()) {
             status.setText("Nothing to run: add at least one request from Proxy history.");
-            appendLog("Run chain ignored: the chain is empty.");
-            log.setCaretPosition(log.getDocument().getLength());
+            appendLog(LogLevel.WARNING, "CHAIN", "No requests to run");
             return;
         }
         saveSelected();
         List<ChainStep> snapshot = List.copyOf(steps);
         int repetitions = ((Number) repetitionCount.getValue()).intValue();
         running = true;
-        appendLog("Starting " + repetitions + " run(s), " + snapshot.size() + " step(s) each...");
-        log.setCaretPosition(log.getDocument().getLength());
+        appendLog(LogLevel.INFO, "CHAIN",
+                "Starting " + repetitions + " run(s) · " + snapshot.size() + " step(s) each");
         status.setText("Running " + snapshot.size() + " request(s)...");
-        new SwingWorker<Void, String>() {
+        new SwingWorker<Void, LogEntry>() {
             @Override protected Void doInBackground() throws Exception {
                 List<ChainEngine.Step> definitions = snapshot.stream()
                         .map(step -> new ChainEngine.Step(step.requestTemplate, Map.copyOf(step.outputs))).toList();
                 for (int run = 1; run <= repetitions; run++) {
                     final int runNumber = run;
-                    publish("Run " + runNumber + "/" + repetitions + " started");
+                    long runStarted = System.nanoTime();
+                    publish(new LogEntry(LogLevel.INFO, "RUN " + runNumber + "/" + repetitions, "Started"));
                     ChainEngine.run(definitions, (index, raw) -> {
                         ChainStep step = snapshot.get(index);
                         HttpRequest request = HttpRequest.httpRequest(step.service, raw);
+                        long stepStarted = System.nanoTime();
                         HttpRequestResponse result = api.http().sendRequest(request);
-                        if (!result.hasResponse()) return null;
-                        step.lastResponse = result.response().toString();
+                        long elapsed = (System.nanoTime() - stepStarted) / 1_000_000;
+                        if (!result.hasResponse()) {
+                            publish(new LogEntry(LogLevel.ERROR, "STEP " + (index + 1),
+                                    "No response · " + elapsed + " ms · " + step.url));
+                            return null;
+                        }
+                        int httpStatus = result.response().statusCode();
+                        publish(new LogEntry(httpStatus < 400 ? LogLevel.SUCCESS : LogLevel.ERROR,
+                                "STEP " + (index + 1), "Run " + runNumber + "/" + repetitions
+                                + " · HTTP " + httpStatus + " · " + elapsed + " ms · " + step.url));
                         step.lastResponse = result.response().toString();
                         step.lastResponseBody = result.response().bodyToString();
-                        return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
-                    }, message -> publish("Run " + runNumber + ": " + message));
+                        return new ChainEngine.Response(httpStatus, step.lastResponse);
+                    }, message -> {
+                        if (message.contains(" = "))
+                            publish(new LogEntry(LogLevel.INFO, "VARIABLE", "Run " + runNumber + "/" + repetitions
+                                    + " · " + message));
+                    });
+                    publish(new LogEntry(LogLevel.SUCCESS, "RUN " + runNumber + "/" + repetitions,
+                            "Completed · " + ((System.nanoTime() - runStarted) / 1_000_000) + " ms"));
                 }
                 return null;
             }
-            @Override protected void process(List<String> messages) {
-                for (String message : messages) appendLog(message);
+            @Override protected void process(List<LogEntry> messages) {
+                for (LogEntry message : messages) appendLog(message);
                 showSelected();
             }
             @Override protected void done() {
                 running = false;
-                try { get(); status.setText("Chain finished successfully."); }
+                try {
+                    get();
+                    status.setText("Chain finished successfully.");
+                    appendLog(LogLevel.SUCCESS, "CHAIN", "All runs completed");
+                }
                 catch (Exception ex) {
                     Throwable cause = ex.getCause() == null ? ex : ex.getCause();
                     status.setText("Chain stopped: " + cause.getMessage());
-                    appendLog(status.getText());
+                    appendLog(LogLevel.ERROR, "CHAIN", "Stopped · " + cause.getMessage());
                 }
             }
         }.execute();
@@ -827,6 +1028,31 @@ public final class ChainExtension implements BurpExtension {
         } catch (Exception ex) { error("Cannot read wordlist: " + ex.getMessage()); }
     }
 
+    private void sendSelectedToRepeater() {
+        int[] selected = table.getSelectedRows();
+        if (selected.length == 0) { error("Select a request first"); return; }
+        saveSelected();
+        try {
+            for (int row : selected) {
+                ChainStep step = steps.get(row);
+                api.repeater().sendToRepeater(
+                        HttpRequest.httpRequest(step.service, step.requestTemplate),
+                        "Requests Chainer - " + currentChainName + " #" + (row + 1));
+            }
+            if (selected.length == 1) {
+                ChainStep target = steps.get(selected[0]);
+                intruderTargetUrl = target.url;
+                intruderTargetIndex = selected[0];
+                intruderChainEnabled = intruderTargetIndex > 0;
+                status.setText("Request sent to Repeater. Include Repeater in the session rule scope to run preceding steps.");
+            } else {
+                status.setText(selected.length + " requests sent to Repeater. Select one target to link the session rule.");
+            }
+        } catch (Exception ex) {
+            error("Cannot send request to Repeater: " + ex.getMessage());
+        }
+    }
+
     private void sendTargetToIntruder() {
         ChainStep step = selectedStep();
         if (step == null) { error("Select the target request first"); return; }
@@ -845,21 +1071,35 @@ public final class ChainExtension implements BurpExtension {
         @Override public ActionResult performAction(SessionHandlingActionData data) {
             if (!intruderChainEnabled || intruderTargetUrl == null || !intruderTargetUrl.equals(data.request().url()))
                 return ActionResult.actionResult(data.request());
+            long started = System.nanoTime();
             try {
                 List<ChainStep> before = List.copyOf(steps.subList(0, intruderTargetIndex));
                 List<ChainEngine.Step> definitions = before.stream().map(s -> new ChainEngine.Step(s.requestTemplate, Map.copyOf(s.outputs))).toList();
                 Map<String, String> variables = ChainEngine.run(definitions, (index, raw) -> {
                     ChainStep step = before.get(index);
+                    long stepStarted = System.nanoTime();
                     HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
-                    if (!result.hasResponse()) return null;
+                    long elapsed = (System.nanoTime() - stepStarted) / 1_000_000;
+                    if (!result.hasResponse()) {
+                        appendLog(LogLevel.ERROR, "SESSION", "Step " + (index + 1) + " · no response · " + elapsed + " ms");
+                        return null;
+                    }
+                    int httpStatus = result.response().statusCode();
+                    appendLog(httpStatus < 400 ? LogLevel.SUCCESS : LogLevel.ERROR, "SESSION",
+                            "Step " + (index + 1) + " · HTTP " + httpStatus + " · " + elapsed + " ms · " + step.url);
                     step.lastResponse = result.response().toString();
                     step.lastResponseBody = result.response().bodyToString();
-                    return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
-                }, message -> appendLog("Session chain: " + message));
+                    return new ChainEngine.Response(httpStatus, step.lastResponse);
+                }, message -> {
+                    if (message.contains(" = ")) appendLog(LogLevel.INFO, "VARIABLE", "Session · " + message);
+                });
+                appendLog(LogLevel.SUCCESS, "SESSION",
+                        "Target prepared · " + ((System.nanoTime() - started) / 1_000_000) + " ms");
                 return ActionResult.actionResult(HttpRequest.httpRequest(data.request().httpService(),
                         Template.renderHttpRequest(data.request().toString(), variables)));
             } catch (Exception ex) {
                 api.logging().logToError("Session chain failed: " + ex.getMessage());
+                appendLog(LogLevel.ERROR, "SESSION", "Preparation failed · " + ex.getMessage());
                 return ActionResult.actionResult(data.request());
             }
         }
@@ -908,10 +1148,71 @@ public final class ChainExtension implements BurpExtension {
         throw new IllegalArgumentException("Mark the target value with {{WORDLIST}} or §value§");
     }
 
+    private static final java.time.format.DateTimeFormatter LOG_TIME =
+            java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+
+    private record LogEntry(LogLevel level, String source, String message, java.time.LocalTime time) {
+        LogEntry(LogLevel level, String source, String message) {
+            this(level, source, message, java.time.LocalTime.now());
+        }
+    }
+
+    private enum LogLevel {
+        INFO("INFO", new Color(0x3974A8)),
+        SUCCESS("OK", new Color(0x35865B)),
+        WARNING("WARN", new Color(0xA96B16)),
+        ERROR("ERROR", new Color(0xC74843));
+
+        final String label;
+        final Color color;
+        LogLevel(String label, Color color) { this.label = label; this.color = color; }
+    }
+
     private void appendLog(String message) {
-        String time = java.time.LocalTime.now().format(java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss.SSS"));
-        log.append("[" + time + "] " + message + "\n");
-        log.setCaretPosition(log.getDocument().getLength());
+        appendLog(LogLevel.INFO, "EVENT", message);
+    }
+
+    private void appendLog(LogLevel level, String source, String message) {
+        appendLog(new LogEntry(level, source, message));
+    }
+
+    private void appendLog(LogEntry entry) {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            SwingUtilities.invokeLater(() -> appendLog(entry));
+            return;
+        }
+        String time = entry.time().format(LOG_TIME);
+        String singleLine = entry.message().replace("\r", "\\r").replace("\n", "\\n");
+        if (singleLine.length() > 500)
+            singleLine = singleLine.substring(0, 500) + "… (+" + (singleLine.length() - 500) + " chars)";
+        StyledDocument document = log.getStyledDocument();
+        try {
+            Style muted = log.getStyle("log-muted");
+            if (muted == null) {
+                muted = log.addStyle("log-muted", null);
+                Color mutedColor = javax.swing.UIManager.getColor("Label.disabledForeground");
+                StyleConstants.setForeground(muted, mutedColor != null ? mutedColor : Color.GRAY);
+            }
+            Style levelStyle = log.getStyle("log-" + entry.level().label);
+            if (levelStyle == null) {
+                levelStyle = log.addStyle("log-" + entry.level().label, null);
+                StyleConstants.setForeground(levelStyle, entry.level().color);
+                StyleConstants.setBold(levelStyle, true);
+            }
+            document.insertString(document.getLength(), time + "  ", muted);
+            document.insertString(document.getLength(), String.format("%-5s", entry.level().label) + "  ", levelStyle);
+            document.insertString(document.getLength(), String.format("%-10s", entry.source()) + "  ", muted);
+            document.insertString(document.getLength(), singleLine + "\n", null);
+            if (document.getLength() > 250_000) {
+                int excess = document.getLength() - 200_000;
+                String beginning = document.getText(0, Math.min(document.getLength(), excess + 1024));
+                int lastLine = beginning.lastIndexOf('\n');
+                if (lastLine >= 0) document.remove(0, lastLine + 1);
+            }
+            log.setCaretPosition(document.getLength());
+        } catch (javax.swing.text.BadLocationException ex) {
+            api.logging().logToError("Activity log update failed: " + ex.getMessage());
+        }
     }
     private void error(String message) { JOptionPane.showMessageDialog(null, message, "Requests Chainer", JOptionPane.ERROR_MESSAGE); }
 

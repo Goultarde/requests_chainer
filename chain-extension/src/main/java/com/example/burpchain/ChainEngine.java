@@ -29,7 +29,7 @@ public final class ChainEngine {
             for (Map.Entry<String, String> output : step.outputs().entrySet()) {
                 String value = extract(response.body(), output.getValue());
                 variables.put(output.getKey(), value);
-                reporter.report("Step " + (i + 1) + ": {{" + output.getKey() + "}} = " + value);
+                reporter.report("Step " + (i + 1) + ": " + output.getKey() + " = " + value);
             }
             reporter.report("Step " + (i + 1) + ": HTTP " + response.status());
         }

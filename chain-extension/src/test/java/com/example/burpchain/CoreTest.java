@@ -26,10 +26,12 @@ class CoreTest {
     }
     @Test void runsThreeRequestsInOrderAndUsesFirstVariableInThird() throws Exception {
         List<String> sent = new ArrayList<>();
+        List<String> events = new ArrayList<>();
         List<ChainEngine.Step> steps = List.of(new ChainEngine.Step("POST /start", Map.of("id", "/result/session/id")), new ChainEngine.Step("POST /prepare", Map.of()), new ChainEngine.Step("POST /use/{{id}}", Map.of()));
-        Map<String, String> result = ChainEngine.run(steps, (index, raw) -> { sent.add(raw); return index == 0 ? new ChainEngine.Response(200, "{\"result\":{\"session\":{\"id\":\"abc-42\"}}}") : new ChainEngine.Response(200, "{}"); }, message -> {});
+        Map<String, String> result = ChainEngine.run(steps, (index, raw) -> { sent.add(raw); return index == 0 ? new ChainEngine.Response(200, "{\"result\":{\"session\":{\"id\":\"abc-42\"}}}") : new ChainEngine.Response(200, "{}"); }, events::add);
         assertEquals(List.of("POST /start", "POST /prepare", "POST /use/abc-42"), sent);
         assertEquals("abc-42", result.get("id"));
+        assertTrue(events.contains("Step 1: id = abc-42"));
     }
     @Test void stopsBeforeUsingMissingVariable() {
         List<ChainEngine.Step> steps = List.of(new ChainEngine.Step("POST /use/{{id}}", Map.of()));
