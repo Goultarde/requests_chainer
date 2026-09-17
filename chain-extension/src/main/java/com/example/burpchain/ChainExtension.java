@@ -3,6 +3,7 @@ package com.example.burpchain;
 import burp.api.montoya.BurpExtension;
 import burp.api.montoya.MontoyaApi;
 import burp.api.montoya.core.Range;
+import burp.api.montoya.core.ByteArray;
 import burp.api.montoya.core.ToolType;
 import burp.api.montoya.http.message.HttpRequestResponse;
 import burp.api.montoya.http.HttpService;
@@ -24,12 +25,14 @@ import burp.api.montoya.ui.editor.HttpRequestEditor;
 import burp.api.montoya.ui.editor.HttpResponseEditor;
 import java.awt.BorderLayout;
 import java.awt.Component;
+import java.awt.Desktop;
 import java.awt.FlowLayout;
 import java.awt.Color;
 import java.awt.Font;
 import java.awt.Toolkit;
 import java.awt.datatransfer.StringSelection;
 import java.io.IOException;
+import java.net.URI;
 import java.util.ArrayList;
 import java.util.ArrayDeque;
 import java.util.Deque;
@@ -72,6 +75,7 @@ import javax.swing.SwingWorker;
 import javax.swing.table.AbstractTableModel;
 
 public final class ChainExtension implements BurpExtension {
+    private static final String WIKI_URL = "https://github.com/Goultarde/requests_chainer/wiki";
     private MontoyaApi api;
     private Component suiteTab;
     private volatile boolean intruderChainEnabled;
@@ -94,7 +98,7 @@ public final class ChainExtension implements BurpExtension {
     private final JComboBox<String> chainSelector = new JComboBox<>();
     private final JTextField variableSearch = new JTextField(12);
     private final JSpinner repetitionCount = new JSpinner(new SpinnerNumberModel(1, 1, 1000, 1));
-    private final Deque<String> requestUndo = new ArrayDeque<>();
+    private final Deque<byte[]> requestUndo = new ArrayDeque<>();
     private java.io.File lastChainDirectory;
     private final TabActivityIndicator tabActivity = new TabActivityIndicator();
     private javax.swing.Timer trafficTimer;
@@ -115,15 +119,19 @@ public final class ChainExtension implements BurpExtension {
         root.setPreferredSize(new java.awt.Dimension(1200, 800));
         JButton up = new JButton("Move up");
         JButton down = new JButton("Move down");
+        JButton disable = new JButton("Disable selected");
+        JButton enable = new JButton("Enable selected");
         JButton remove = new JButton("Remove");
         JButton save = new JButton("Save request edit");
         JButton variable = new JButton("Variable from response selection");
         JButton insert = new JButton("Insert variable");
         JButton intruder = new JButton("Send target to Intruder");
         JButton repeater = new JButton("Send to Repeater");
-        JButton sessionRule = new JButton("⚙ Configure Intruder session rule");
+        JButton pointRequest = new JButton("Point this request");
+        JButton sessionRule = new JButton("⚙ Configure session rule");
         JButton saveChain = new JButton("Save chains");
         JButton loadChain = new JButton("Load chains");
+        JButton help = new JButton("Help");
         JButton deleteVariable = new JButton("Delete variable");
         JButton editVariable = new JButton("Edit variable");
         JButton replaceAll = new JButton("Replace in all requests");
@@ -137,10 +145,12 @@ public final class ChainExtension implements BurpExtension {
         run.setToolTipText("Execute all requests in order (Ctrl+Alt+R)");
         intruder.setToolTipText("Use the selected request as the Intruder target (Ctrl+I)");
         repeater.setToolTipText("Open the selected request(s) in Burp Repeater (Ctrl+R)");
+        pointRequest.setToolTipText("Use the selected request as the session-rule target without sending it again");
         variable.setToolTipText("Select a value in the response editor to create a reusable variable");
         variableSearch.setToolTipText("Filter the variable list");
         variableBox.setToolTipText("Select a variable to insert or manage");
         chainSelector.setToolTipText("Choose the chain to edit");
+        help.setToolTipText("Open the Requests Chainer wiki in your browser");
         chainSelector.setPrototypeDisplayValue("A chain with a long name");
         variableBox.setPrototypeDisplayValue("A long variable name");
         repetitionCount.setToolTipText("Number of complete chain executions (1-1000)");
@@ -150,8 +160,8 @@ public final class ChainExtension implements BurpExtension {
         Color separator = javax.swing.UIManager.getColor("Separator.foreground");
         top.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0,
                 separator != null ? separator : Color.GRAY));
-        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain));
-        top.add(toolbarRow("RUN", run, new JLabel("Runs:"), repetitionCount, clear, intruder, repeater, sessionRule));
+        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain, help));
+        top.add(toolbarRow("RUN", run, new JLabel("Runs:"), repetitionCount, clear, intruder, repeater, pointRequest, sessionRule));
         top.add(toolbarRow("VARIABLES", new JLabel("Find:"), variableSearch, variableBox, insert, variable, editVariable, deleteVariable));
         top.add(toolbarRow("EDIT", save, replaceAll, propagateHeader));
         root.addComponentListener(new java.awt.event.ComponentAdapter() {
@@ -169,16 +179,23 @@ public final class ChainExtension implements BurpExtension {
         table.setRowHeight(Math.max(26, table.getRowHeight()));
         table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
         table.setFillsViewportHeight(true);
-        table.getColumnModel().getColumn(0).setPreferredWidth(55);
-        table.getColumnModel().getColumn(0).setMaxWidth(80);
-        table.getColumnModel().getColumn(1).setPreferredWidth(600);
-        table.getColumnModel().getColumn(2).setPreferredWidth(250);
+        table.getColumnModel().getColumn(0).setPreferredWidth(68);
+        table.getColumnModel().getColumn(0).setMaxWidth(85);
+        table.getColumnModel().getColumn(1).setPreferredWidth(55);
+        table.getColumnModel().getColumn(1).setMaxWidth(80);
+        table.getColumnModel().getColumn(2).setPreferredWidth(600);
+        table.getColumnModel().getColumn(3).setPreferredWidth(250);
         JPanel stepsPanel = new JPanel(new BorderLayout(4, 4));
-        JPanel stepsHeader = new JPanel(new BorderLayout());
-        stepsHeader.add(sectionTitle("Chain steps"), BorderLayout.WEST);
-        JPanel stepActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
-        stepActions.add(up); stepActions.add(down); stepActions.add(remove);
-        stepsHeader.add(stepActions, BorderLayout.EAST);
+        JPanel stepsHeader = new JPanel(new WrapLayout(FlowLayout.LEFT, 5, 0));
+        stepsHeader.add(sectionTitle("Chain steps"));
+        stepsHeader.add(up);
+        stepsHeader.add(down);
+        stepsHeader.add(disable);
+        stepsHeader.add(enable);
+        stepsHeader.add(remove);
+        stepsHeader.addComponentListener(new java.awt.event.ComponentAdapter() {
+            @Override public void componentResized(java.awt.event.ComponentEvent e) { stepsPanel.revalidate(); }
+        });
         stepsPanel.add(stepsHeader, BorderLayout.NORTH);
         stepsPanel.add(new JScrollPane(table), BorderLayout.CENTER);
         // Montoya's native editors provide their own scrolling and syntax coloring.
@@ -243,15 +260,19 @@ public final class ChainExtension implements BurpExtension {
         });
         up.addActionListener(e -> move(-1));
         down.addActionListener(e -> move(1));
+        disable.addActionListener(e -> setSelectedStepsEnabled(false));
+        enable.addActionListener(e -> setSelectedStepsEnabled(true));
         remove.addActionListener(e -> removeSelected());
         save.addActionListener(e -> { saveSelected(); status.setText("Request edit saved for the selected chain step."); });
-        variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor)));
+        variable.addActionListener(e -> createVariable(selectedStep(), selectedText(responseEditor), selectedOffset(responseEditor)));
         insert.addActionListener(e -> insertVariable());
         intruder.addActionListener(e -> sendTargetToIntruder());
         repeater.addActionListener(e -> sendSelectedToRepeater());
+        pointRequest.addActionListener(e -> pointSelectedRequest());
         sessionRule.addActionListener(e -> showSessionRuleInstructions());
         saveChain.addActionListener(e -> saveChain());
         loadChain.addActionListener(e -> loadChain());
+        help.addActionListener(e -> openWiki());
         deleteVariable.addActionListener(e -> deleteVariable());
         editVariable.addActionListener(e -> editVariable());
         newChain.addActionListener(e -> createNewChain());
@@ -354,7 +375,17 @@ public final class ChainExtension implements BurpExtension {
             JMenuItem sendIntruder = new JMenuItem("Send target to Intruder");
             sendIntruder.addActionListener(e -> sendTargetToIntruder());
             popup.add(sendIntruder);
+            JMenuItem pointRequest = new JMenuItem("Point this request");
+            pointRequest.addActionListener(e -> pointSelectedRequest());
+            popup.add(pointRequest);
         }
+        popup.addSeparator();
+        JMenuItem disable = new JMenuItem("Disable selected");
+        disable.addActionListener(e -> setSelectedStepsEnabled(false));
+        popup.add(disable);
+        JMenuItem enable = new JMenuItem("Enable selected");
+        enable.addActionListener(e -> setSelectedStepsEnabled(true));
+        popup.add(enable);
         popup.addSeparator();
         JMenuItem scan = new JMenuItem("Start active scan");
         scan.addActionListener(e -> startActiveScanForSelection());
@@ -369,7 +400,7 @@ public final class ChainExtension implements BurpExtension {
                     BuiltInAuditConfiguration.LEGACY_ACTIVE_AUDIT_CHECKS));
             for (int row : table.getSelectedRows()) {
                 ChainStep step = steps.get(row);
-                audit.addRequest(HttpRequest.httpRequest(step.service, step.requestTemplate));
+                audit.addRequest(step.request());
             }
             status.setText("Active scan started for " + table.getSelectedRowCount() + " request(s).");
         } catch (Exception ex) {
@@ -377,20 +408,88 @@ public final class ChainExtension implements BurpExtension {
         }
     }
 
+    private void openWiki() {
+        JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(suiteTab),
+                "Requests Chainer help", java.awt.Dialog.ModalityType.MODELESS);
+        JPanel panel = new JPanel(new BorderLayout(8, 10));
+        panel.setBorder(BorderFactory.createEmptyBorder(14, 16, 14, 16));
+        panel.add(new JLabel("Requests Chainer wiki:"), BorderLayout.NORTH);
+        JTextField link = new JTextField(WIKI_URL);
+        link.setEditable(false);
+        link.setToolTipText("Select and copy this complete URL");
+        panel.add(link, BorderLayout.CENTER);
+        JLabel feedback = new JLabel("Open the wiki in your browser or copy its address.");
+        JPanel actions = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton open = new JButton("Open in browser");
+        open.addActionListener(e -> {
+            open.setEnabled(false);
+            feedback.setText("Opening browser...");
+            new SwingWorker<Void, Void>() {
+                @Override protected Void doInBackground() throws Exception {
+                    if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                        try {
+                            Desktop.getDesktop().browse(URI.create(WIKI_URL));
+                            return null;
+                        } catch (Exception ignored) {
+                            // Try the system opener below if Java's Desktop integration fails.
+                        }
+                    }
+                    if (!System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT).contains("linux"))
+                        throw new IOException("No browser opener is available");
+                    Process process = new ProcessBuilder("xdg-open", WIKI_URL)
+                            .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                            .redirectError(ProcessBuilder.Redirect.DISCARD).start();
+                    if (process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS) && process.exitValue() != 0)
+                        throw new IOException("xdg-open could not launch a browser");
+                    return null;
+                }
+                @Override protected void done() {
+                    open.setEnabled(true);
+                    try {
+                        get();
+                        dialog.dispose();
+                        status.setText("Requests Chainer wiki opened in your browser.");
+                    } catch (Exception ex) {
+                        feedback.setText("Browser unavailable. Select the URL above or use Copy link.");
+                    }
+                }
+            }.execute();
+        });
+        JButton copy = new JButton("Copy link");
+        copy.addActionListener(e -> {
+            Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(WIKI_URL), null);
+            feedback.setText("Wiki link copied to clipboard.");
+        });
+        JButton close = new JButton("Close");
+        close.addActionListener(e -> dialog.dispose());
+        actions.add(feedback);
+        actions.add(open);
+        actions.add(copy);
+        actions.add(close);
+        panel.add(actions, BorderLayout.SOUTH);
+        dialog.setContentPane(panel);
+        dialog.setSize(800, 150);
+        dialog.setLocationRelativeTo(suiteTab);
+        dialog.setVisible(true);
+        link.selectAll();
+        link.requestFocusInWindow();
+    }
+
     private void showSessionRuleInstructions() {
         JDialog dialog = new JDialog(SwingUtilities.getWindowAncestor(suiteTab),
-                "Configure Intruder session rule", java.awt.Dialog.ModalityType.APPLICATION_MODAL);
+                "Configure session rule", java.awt.Dialog.ModalityType.APPLICATION_MODAL);
         JPanel panel = new JPanel(new BorderLayout(8, 8));
         panel.setBorder(BorderFactory.createEmptyBorder(12, 12, 12, 12));
         JTextArea instructions = new JTextArea(
-                "Requests Chainer — Intruder session rule\n\n"
+                "Requests Chainer — session rule\n\n"
                 + "1. Open Settings → Sessions → Session handling rules.\n"
                 + "2. Click Add.\n"
                 + "3. Add the action: Invoke a Burp extension.\n"
                 + "4. Select: Requests Chainer - run preceding chain.\n"
                 + "5. Set the scope to: Include all URLs.\n"
                 + "6. Enable the rule and click OK.\n\n"
-                + "Then use Send target to Intruder in Requests Chainer before starting Intruder.");
+                + "Then use Point this request for a request already in Intruder or Repeater, "
+                + "or send it from Requests Chainer. Include the relevant tool in the rule scope.");
         instructions.setEditable(false);
         instructions.setOpaque(false);
         instructions.setLineWrap(true);
@@ -536,17 +635,21 @@ public final class ChainExtension implements BurpExtension {
             model.fireTableDataChanged();
             table.setRowSelectionInterval(steps.size() - 1, steps.size() - 1);
         }
-        createVariable(step, value);
+        createVariable(step, value, range.startIndexInclusive());
     }
 
-    private void createVariable(ChainStep step, String selected) {
+    private void createVariable(ChainStep step, String selected, int selectedByteOffset) {
         if (step == null) { error("Select a request first"); return; }
         String value = selected.trim();
+        int selectedAt = byteOffsetToCharIndex(step.lastResponse, selectedByteOffset);
+        if (selectedAt >= 0 && !value.isEmpty()) selectedAt += selected.indexOf(value);
         if (value.isEmpty()) value = guessSelectedValue(step);
-        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\""))
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
             value = value.substring(1, value.length() - 1);
+            if (selectedAt >= 0) selectedAt++;
+        }
         if (value.isEmpty() && step.lastResponse.isEmpty()) { error("La réponse de cette requête est vide"); return; }
-        String name = defineParameter(step, value);
+        String name = defineParameter(step, value, selectedAt);
         if (name == null) return;
         for (ChainStep existing : steps) {
             if (existing != step && existing.outputs.containsKey(name)) {
@@ -575,16 +678,16 @@ public final class ChainExtension implements BurpExtension {
 
     private String parameterSelector;
     private String parameterNameDefault = "id";
-    private String defineParameter(ChainStep step, String value) {
+    private String defineParameter(ChainStep step, String value, int preferredAt) {
         JPanel panel = new JPanel(new BorderLayout(8, 8));
         JPanel fields = new JPanel(new java.awt.GridLayout(0, 2, 5, 5));
         JTextField name = new JTextField(parameterNameDefault);
         // Use the complete HTTP response so headers such as Set-Cookie can be captured too.
         String responseText = step.lastResponse;
-        String[] delimiters = bestDelimiters(responseText, value);
+        String[] delimiters = DelimiterSuggestions.bestDelimiters(responseText, value, preferredAt);
         JTextField prefix = new JTextField(delimiters[0]);
         JTextField suffix = new JTextField(delimiters[1]);
-        JTextField regex = new JTextField(defaultRegex(responseText, value, delimiters[0], delimiters[1]));
+        JTextField regex = new JTextField(DelimiterSuggestions.defaultRegex(delimiters[0], delimiters[1]));
         JCheckBox caseSensitive = new JCheckBox("Case sensitive", true);
         fields.add(new JLabel("Parameter name:")); fields.add(name);
         fields.add(new JLabel("Define start (start after):")); fields.add(prefix);
@@ -607,17 +710,25 @@ public final class ChainExtension implements BurpExtension {
         lower.add(preview, BorderLayout.SOUTH);
         HttpResponseEditor responseSample = api.userInterface().createHttpResponseEditor();
         responseSample.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(responseText));
-        int selectedAt = responseText.indexOf(value);
+        final String[] lastSelection = {""};
         Runnable syncSelection = () -> {
-            String selectedValue = responseSample.selection().map(s -> s.contents().toString()).orElse("").trim();
+            var selection = responseSample.selection().orElse(null);
+            if (selection == null) return;
+            String rawSelection = selection.contents().toString();
+            String selectedValue = rawSelection.trim();
             if (selectedValue.isEmpty()) return;
-            String[] selectedDelimiters = bestDelimiters(responseText, selectedValue);
+            String selectionKey = selection.offsets().startIndexInclusive() + ":"
+                    + selection.offsets().endIndexExclusive() + ":" + rawSelection;
+            if (selectionKey.equals(lastSelection[0])) return;
+            lastSelection[0] = selectionKey;
+            int at = byteOffsetToCharIndex(responseText, selection.offsets().startIndexInclusive());
+            if (at >= 0) at += rawSelection.indexOf(selectedValue);
+            String[] selectedDelimiters = DelimiterSuggestions.bestDelimiters(responseText, selectedValue, at);
             prefix.setText(selectedDelimiters[0]);
             suffix.setText(selectedDelimiters[1]);
-            regex.setText(defaultRegex(responseText, selectedValue, selectedDelimiters[0], selectedDelimiters[1]));
+            regex.setText(DelimiterSuggestions.defaultRegex(selectedDelimiters[0], selectedDelimiters[1]));
             preview.setText("Preview: " + selectedValue);
         };
-        if (selectedAt >= 0) syncSelection.run();
         javax.swing.Timer selectionTimer = new javax.swing.Timer(250, e -> syncSelection.run());
         selectionTimer.start();
         Component responseComponent = responseSample.uiComponent();
@@ -665,57 +776,6 @@ public final class ChainExtension implements BurpExtension {
         return pane;
     }
 
-    private String[] defaultDelimiters(String body, String value) {
-        int at = body.indexOf(value);
-        if (at < 0) return new String[]{"", ""};
-        int line = Math.max(body.lastIndexOf("\n", at), body.lastIndexOf("\r", at));
-        int semi = body.lastIndexOf(';', at);
-        int start;
-        if (semi < line) {
-            start = line + 1;
-        } else {
-            start = semi + 1;
-            while (start < at && Character.isWhitespace(body.charAt(start))) start++;
-        }
-        String prefix = body.substring(start, at);
-        int lineEnd = body.indexOf('\n', at + value.length());
-        if (lineEnd < 0) lineEnd = body.length();
-        int contentEnd = lineEnd > 0 && body.charAt(lineEnd - 1) == '\r' ? lineEnd - 1 : lineEnd;
-        int end = body.indexOf(';', at + value.length());
-        if (end < 0 || end > lineEnd) end = -1;
-        String suffix = "";
-        if (end >= 0) {
-            int equals = body.indexOf('=', end + 1);
-            suffix = equals >= 0 ? body.substring(end, equals + 1) : body.substring(end);
-        } else {
-            suffix = body.substring(at + value.length(), contentEnd);
-        }
-        return new String[]{prefix, suffix};
-    }
-    private String[] bestDelimiters(String response, String value) {
-        // Algorithm adapted from ExtendedMacro's ExtStringCreator (MIT license).
-        int at = response.indexOf(value);
-        if (at < 0 || value.isEmpty()) return defaultDelimiters(response, value);
-        int before = Math.max(0, at - 8), after = Math.min(response.length(), at + value.length() + 8);
-        while (true) {
-            String prefix = response.substring(before, at);
-            String suffix = response.substring(at + value.length(), after);
-            int start = prefix.isEmpty() ? 0 : response.indexOf(prefix);
-            int end = start < 0 ? -1 : response.indexOf(suffix, start + prefix.length());
-            String extracted = start < 0 || end < 0 ? "" : response.substring(start + prefix.length(), end);
-            if (value.equals(extracted)) return new String[]{prefix, suffix};
-            int oldBefore = before, oldAfter = after;
-            before = Math.max(0, before - 8);
-            after = Math.min(response.length(), after + 8);
-            if (before == oldBefore && after == oldAfter) break;
-        }
-        return defaultDelimiters(response, value);
-    }
-    private String escapeRegex(String value) { return value.replaceAll("([\\\\.\\[\\]{}()*+?^$|])", "\\\\$1"); }
-    private String defaultRegex(String response, String value, String prefix, String suffix) {
-        String[] best = bestDelimiters(response, value);
-        return escapeRegex(best[0]) + "(.*?)" + escapeRegex(best[1]);
-    }
     private String encode(String prefix, String suffix) {
         return java.util.Base64.getUrlEncoder().encodeToString(prefix.getBytes(StandardCharsets.UTF_8)) + "." + java.util.Base64.getUrlEncoder().encodeToString(suffix.getBytes(StandardCharsets.UTF_8));
     }
@@ -724,40 +784,37 @@ public final class ChainExtension implements BurpExtension {
         if (selectedStep() == null) { error("Select a destination request first"); return; }
         String name = (String) variableBox.getSelectedItem();
         if (name == null || name.isBlank()) { error("No variable matches the search"); return; }
-        String current = requestEditor.getRequest().toString();
         String replacement = "{{" + name + "}}";
-        String updated;
+        byte[] original = requestEditor.getRequest().toByteArray().getBytes();
+        byte[] replacementBytes = ByteArray.byteArray(replacement).getBytes();
+        byte[] updated;
         java.util.Optional<burp.api.montoya.ui.Selection> selectedRequest = requestEditor.selection();
         if (selectedRequest.isPresent() && selectedRequest.get().offsets().startIndexInclusive() < selectedRequest.get().offsets().endIndexExclusive()) {
-            byte[] original = requestEditor.getRequest().toByteArray().getBytes();
             burp.api.montoya.core.Range range = selectedRequest.get().offsets();
-            byte[] replacementBytes = replacement.getBytes(StandardCharsets.UTF_8);
-            byte[] result = new byte[original.length - (range.endIndexExclusive() - range.startIndexInclusive()) + replacementBytes.length];
-            System.arraycopy(original, 0, result, 0, range.startIndexInclusive());
-            System.arraycopy(replacementBytes, 0, result, range.startIndexInclusive(), replacementBytes.length);
-            System.arraycopy(original, range.endIndexExclusive(), result, range.startIndexInclusive() + replacementBytes.length, original.length - range.endIndexExclusive());
-            updated = new String(result, StandardCharsets.UTF_8);
+            updated = ByteSplice.replace(original, range.startIndexInclusive(), range.endIndexExclusive(), replacementBytes);
         } else {
             int caret = requestEditor.caretPosition();
-            updated = current.substring(0, caret) + replacement + current.substring(caret);
+            updated = ByteSplice.replace(original, caret, caret, replacementBytes);
         }
-        requestEditor.setRequest(HttpRequest.httpRequest(selectedStep().service, updated));
-        saveSelected();
+        HttpRequest updatedRequest = HttpRequest.httpRequest(selectedStep().service, ByteArray.byteArray(updated));
+        requestEditor.setRequest(updatedRequest);
+        selectedStep().setRequest(updatedRequest);
     }
 
     private void saveSelected() {
         ChainStep step = selectedStep();
-        if (step != null) {
-            String updated = requestEditor.getRequest().toString();
-            if (!updated.equals(step.requestTemplate)) requestUndo.push(step.requestTemplate);
-            step.requestTemplate = updated;
+        if (step != null && requestEditor.isModified()) {
+            HttpRequest updated = requestEditor.getRequest();
+            if (!java.util.Arrays.equals(updated.toByteArray().getBytes(), step.requestBytes))
+                requestUndo.push(step.requestBytes.clone());
+            step.setRequest(updated);
         }
     }
     private void undoRequestEdit() {
         ChainStep step = selectedStep();
         if (step == null || requestUndo.isEmpty()) return;
-        step.requestTemplate = requestUndo.pop();
-        requestEditor.setRequest(HttpRequest.httpRequest(step.service, step.requestTemplate));
+        step.setRequest(HttpRequest.httpRequest(step.service, ByteArray.byteArray(requestUndo.pop())));
+        requestEditor.setRequest(step.request());
         status.setText("Last request edit undone.");
     }
     private void refreshVariables() {
@@ -769,13 +826,22 @@ public final class ChainExtension implements BurpExtension {
         if (current != null) variableBox.setSelectedItem(current);
     }
     private String selectedText(HttpResponseEditor area) { return area.selection().map(s -> s.contents().toString()).orElse(""); }
+    private int selectedOffset(HttpResponseEditor area) {
+        return area.selection().map(s -> s.offsets().startIndexInclusive()).orElse(-1);
+    }
+    private static int byteOffsetToCharIndex(String text, int byteOffset) {
+        if (byteOffset < 0) return -1;
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        if (byteOffset > bytes.length) return -1;
+        return new String(bytes, 0, byteOffset, StandardCharsets.UTF_8).length();
+    }
     private ChainStep selectedStep() { int row = table.getSelectedRow(); return row < 0 || row >= steps.size() ? null : steps.get(row); }
     private void showSelected() {
-        if (displayedStep != null) displayedStep.requestTemplate = requestEditor.getRequest().toString();
+        if (displayedStep != null && requestEditor.isModified()) displayedStep.setRequest(requestEditor.getRequest());
         ChainStep step = selectedStep();
         displayedStep = step;
         if (step != null) {
-            requestEditor.setRequest(HttpRequest.httpRequest(step.service, step.requestTemplate));
+            requestEditor.setRequest(step.request());
             responseEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(step.lastResponse));
         } else {
             requestEditor.setRequest(HttpRequest.httpRequest());
@@ -804,7 +870,7 @@ public final class ChainExtension implements BurpExtension {
         for (ChainStep step : steps) {
             if (step.outputs.containsKey(name)) {
                 parameterNameDefault = name;
-                createVariable(step, selectedText(responseEditor));
+                createVariable(step, selectedText(responseEditor), selectedOffset(responseEditor));
                 parameterNameDefault = "id";
                 return;
             }
@@ -824,7 +890,7 @@ public final class ChainExtension implements BurpExtension {
         int changed = 0;
         for (ChainStep step : steps) {
             String updated = step.requestTemplate.replace(search.getText(), replacement.getText());
-            if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
+            if (!updated.equals(step.requestTemplate)) { step.setTemplateText(updated); changed++; }
         }
         displayedStep = null;
         model.fireTableDataChanged();
@@ -844,7 +910,7 @@ public final class ChainExtension implements BurpExtension {
         int changed = 0;
         for (ChainStep step : steps) {
             String updated = pattern.matcher(step.requestTemplate).replaceAll("$1{{" + java.util.regex.Matcher.quoteReplacement(variable) + "}}");
-            if (!updated.equals(step.requestTemplate)) { step.requestTemplate = updated; changed++; }
+            if (!updated.equals(step.requestTemplate)) { step.setTemplateText(updated); changed++; }
         }
         displayedStep = null; model.fireTableDataChanged(); showSelected();
         status.setText("Header " + header.getText() + " now uses {{" + variable + "}} in " + changed + " request(s).");
@@ -867,7 +933,9 @@ public final class ChainExtension implements BurpExtension {
             for (Map.Entry<String, List<ChainStep>> chain : namedChains.entrySet()) {
                 out.write("C\t" + b64(chain.getKey()) + "\n");
                 for (ChainStep step : chain.getValue()) {
-                out.write("S\t" + b64(step.service.host()) + "\t" + step.service.port() + "\t" + step.service.secure() + "\t" + b64(step.requestTemplate) + "\n");
+                out.write("S\t" + b64(step.service.host()) + "\t" + step.service.port() + "\t" + step.service.secure()
+                        + "\t" + b64(step.requestTemplate) + "\t" + step.enabled + "\t"
+                        + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(step.requestBytes) + "\n");
                 for (Map.Entry<String, String> output : step.outputs.entrySet()) out.write("V\t" + b64(output.getKey()) + "\t" + b64(output.getValue()) + "\n");
                 out.write("E\n");
                 }
@@ -896,6 +964,9 @@ public final class ChainExtension implements BurpExtension {
                 } else if (parts[0].equals("S")) {
                     HttpService service = HttpService.httpService(unb64(parts[1]), Integer.parseInt(parts[2]), Boolean.parseBoolean(parts[3]));
                     current = new ChainStep(service, unb64(parts[4]));
+                    if (parts.length > 5) current.enabled = Boolean.parseBoolean(parts[5]);
+                    if (parts.length > 6) current.setRequest(HttpRequest.httpRequest(service,
+                            ByteArray.byteArray(java.util.Base64.getUrlDecoder().decode(parts[6]))));
                     String active = legacy ? "Default" : namedChains.keySet().stream().reduce((a, b) -> b).orElse("Default");
                     namedChains.get(active).add(current);
                 } else if (parts[0].equals("V") && current != null) current.outputs.put(unb64(parts[1]), unb64(parts[2]));
@@ -916,6 +987,46 @@ public final class ChainExtension implements BurpExtension {
         else showSelected();
     }
 
+    private void setSelectedStepsEnabled(boolean enabled) {
+        int[] selected = table.getSelectedRows();
+        if (selected.length == 0) return;
+        for (int row : selected) steps.get(row).enabled = enabled;
+        refreshPointedTargetState();
+        model.fireTableRowsUpdated(selected[0], selected[selected.length - 1]);
+        status.setText(selected.length + " request(s) " + (enabled ? "enabled" : "disabled") + " in the chain.");
+    }
+
+    private void refreshPointedTargetState() {
+        if (intruderTargetUrl == null) return;
+        if (intruderTargetIndex <= 0 || intruderTargetIndex >= steps.size()
+                || !steps.get(intruderTargetIndex).enabled) {
+            intruderChainEnabled = false;
+            return;
+        }
+        try {
+            ChainStep target = steps.get(intruderTargetIndex);
+            intruderChainEnabled = intruderTargetUrl.equals(target.request().url());
+        } catch (Exception ex) {
+            intruderChainEnabled = false;
+        }
+    }
+
+    private static List<ChainStep> enabledSteps(List<ChainStep> candidates) {
+        return candidates.stream().filter(step -> step.enabled).toList();
+    }
+
+    private HttpRequest renderedStepRequest(ChainStep step, String rendered) {
+        return rendered.equals(step.requestTemplate)
+                ? step.request() : HttpRequest.httpRequest(step.service, rendered);
+    }
+
+    private HttpRequest renderedStepRequest(ChainStep step, String rendered, Map<String, String> variables) {
+        if (rendered.equals(step.requestTemplate)) return step.request();
+        byte[] bytes = ByteTemplate.render(step.requestBytes, variables,
+                value -> ByteArray.byteArray(value).getBytes());
+        return HttpRequest.httpRequest(step.service, ByteArray.byteArray(bytes));
+    }
+
     private void runChain() {
         if (running) { error("A chain is already running"); return; }
         if (steps.isEmpty()) {
@@ -924,7 +1035,12 @@ public final class ChainExtension implements BurpExtension {
             return;
         }
         saveSelected();
-        List<ChainStep> snapshot = List.copyOf(steps);
+        List<ChainStep> snapshot = enabledSteps(List.copyOf(steps));
+        if (snapshot.isEmpty()) {
+            status.setText("Nothing to run: enable at least one request in the chain.");
+            appendLog(LogLevel.WARNING, "CHAIN", "All requests are disabled");
+            return;
+        }
         int repetitions = ((Number) repetitionCount.getValue()).intValue();
         running = true;
         appendLog(LogLevel.INFO, "CHAIN",
@@ -938,9 +1054,9 @@ public final class ChainExtension implements BurpExtension {
                     final int runNumber = run;
                     long runStarted = System.nanoTime();
                     publish(new LogEntry(LogLevel.INFO, "RUN " + runNumber + "/" + repetitions, "Started"));
-                    ChainEngine.run(definitions, (index, raw) -> {
+                    ChainEngine.run(definitions, (index, raw, variables) -> {
                         ChainStep step = snapshot.get(index);
-                        HttpRequest request = HttpRequest.httpRequest(step.service, raw);
+                        HttpRequest request = renderedStepRequest(step, raw, variables);
                         long stepStarted = System.nanoTime();
                         HttpRequestResponse result = api.http().sendRequest(request);
                         long elapsed = (System.nanoTime() - stepStarted) / 1_000_000;
@@ -990,6 +1106,7 @@ public final class ChainExtension implements BurpExtension {
         if (running) { error("A chain is already running"); return; }
         int target = table.getSelectedRow();
         if (target < 0 || target >= steps.size()) { error("Select the chain request that will receive the wordlist"); return; }
+        if (!steps.get(target).enabled) { error("Enable the selected request before using a wordlist"); return; }
         JFileChooser chooser = new JFileChooser();
         if (chooser.showOpenDialog(null) != JFileChooser.APPROVE_OPTION) return;
         try {
@@ -997,7 +1114,8 @@ public final class ChainExtension implements BurpExtension {
                     .stream().filter(line -> !line.isEmpty()).toList();
             if (payloads.isEmpty()) { error("The wordlist is empty"); return; }
             saveSelected();
-            List<ChainStep> snapshot = List.copyOf(steps);
+            ChainStep targetStep = steps.get(target);
+            List<ChainStep> snapshot = enabledSteps(List.copyOf(steps));
             running = true;
             appendLog("Starting wordlist run: " + payloads.size() + " payload(s), target step " + (target + 1));
             new SwingWorker<Void, String>() {
@@ -1007,13 +1125,13 @@ public final class ChainExtension implements BurpExtension {
                         List<ChainEngine.Step> definitions = new ArrayList<>();
                         for (int i = 0; i < snapshot.size(); i++) {
                             String template = snapshot.get(i).requestTemplate;
-                            if (i == target) template = injectWordlist(template, payload);
+                            if (snapshot.get(i) == targetStep) template = injectWordlist(template, payload);
                             definitions.add(new ChainEngine.Step(template, Map.copyOf(snapshot.get(i).outputs)));
                         }
                         final int runNumber = n + 1;
                         ChainEngine.run(definitions, (index, raw) -> {
                             ChainStep step = snapshot.get(index);
-                            HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
+                            HttpRequestResponse result = api.http().sendRequest(renderedStepRequest(step, raw));
                             if (!result.hasResponse()) return null;
                             step.lastResponse = result.response().toString();
                             step.lastResponseBody = result.response().bodyToString();
@@ -1036,15 +1154,17 @@ public final class ChainExtension implements BurpExtension {
             for (int row : selected) {
                 ChainStep step = steps.get(row);
                 api.repeater().sendToRepeater(
-                        HttpRequest.httpRequest(step.service, step.requestTemplate),
+                        step.request(),
                         "Requests Chainer - " + currentChainName + " #" + (row + 1));
             }
             if (selected.length == 1) {
                 ChainStep target = steps.get(selected[0]);
-                intruderTargetUrl = target.url;
-                intruderTargetIndex = selected[0];
-                intruderChainEnabled = intruderTargetIndex > 0;
-                status.setText("Request sent to Repeater. Include Repeater in the session rule scope to run preceding steps.");
+                if (target.enabled) {
+                    pointToStep(target);
+                    status.setText("Request sent to Repeater. Include Repeater in the session rule scope to run preceding steps.");
+                } else {
+                    status.setText("Request sent to Repeater. Enable this step to use it as a session-rule target.");
+                }
             } else {
                 status.setText(selected.length + " requests sent to Repeater. Select one target to link the session rule.");
             }
@@ -1053,16 +1173,51 @@ public final class ChainExtension implements BurpExtension {
         }
     }
 
+    private void pointSelectedRequest() {
+        if (table.getSelectedRowCount() != 1) {
+            error("Select exactly one target request in the chain");
+            return;
+        }
+        ChainStep step = selectedStep();
+        if (!step.enabled) {
+            error("Enable this request before pointing it as the session-rule target");
+            return;
+        }
+        if (steps.indexOf(step) == 0) {
+            error("Select a request after at least one preceding chain step");
+            return;
+        }
+        saveSelected();
+        try {
+            pointToStep(step);
+            status.setText("Target pointed: step " + (intruderTargetIndex + 1)
+                    + ". The session rule will run preceding steps for this URL in Repeater or Intruder.");
+        } catch (Exception ex) {
+            error("Cannot point to this request: " + ex.getMessage());
+        }
+    }
+
+    private void pointToStep(ChainStep step) {
+        if (!step.enabled) throw new IllegalStateException("Enable this request before pointing it as a target");
+        int index = steps.indexOf(step);
+        String url = step.request().url();
+        intruderTargetIndex = index;
+        intruderTargetUrl = url;
+        intruderChainEnabled = index > 0 && step.enabled;
+    }
+
     private void sendTargetToIntruder() {
         ChainStep step = selectedStep();
         if (step == null) { error("Select the target request first"); return; }
         saveSelected();
         try {
-            intruderTargetUrl = step.url;
-            intruderTargetIndex = steps.indexOf(step);
-            intruderChainEnabled = intruderTargetIndex > 0;
-            api.intruder().sendToIntruder(HttpRequest.httpRequest(step.service, step.requestTemplate), "Requests Chainer");
-            status.setText("Target sent. Add 'Requests Chainer - run preceding chain' to a Burp Session handling rule for Intruder.");
+            api.intruder().sendToIntruder(step.request(), "Requests Chainer");
+            if (step.enabled) {
+                pointToStep(step);
+                status.setText("Target sent. Add 'Requests Chainer - run preceding chain' to a Burp Session handling rule for Intruder.");
+            } else {
+                status.setText("Request sent to Intruder. Enable this step to use it as a session-rule target.");
+            }
         } catch (Exception ex) { error("Cannot send request to Intruder: " + ex.getMessage()); }
     }
 
@@ -1073,12 +1228,12 @@ public final class ChainExtension implements BurpExtension {
                 return ActionResult.actionResult(data.request());
             long started = System.nanoTime();
             try {
-                List<ChainStep> before = List.copyOf(steps.subList(0, intruderTargetIndex));
+                List<ChainStep> before = enabledSteps(List.copyOf(steps.subList(0, intruderTargetIndex)));
                 List<ChainEngine.Step> definitions = before.stream().map(s -> new ChainEngine.Step(s.requestTemplate, Map.copyOf(s.outputs))).toList();
-                Map<String, String> variables = ChainEngine.run(definitions, (index, raw) -> {
+                Map<String, String> variables = ChainEngine.run(definitions, (index, raw, resolvedVariables) -> {
                     ChainStep step = before.get(index);
                     long stepStarted = System.nanoTime();
-                    HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
+                    HttpRequestResponse result = api.http().sendRequest(renderedStepRequest(step, raw, resolvedVariables));
                     long elapsed = (System.nanoTime() - stepStarted) / 1_000_000;
                     if (!result.hasResponse()) {
                         appendLog(LogLevel.ERROR, "SESSION", "Step " + (index + 1) + " · no response · " + elapsed + " ms");
@@ -1095,8 +1250,12 @@ public final class ChainExtension implements BurpExtension {
                 });
                 appendLog(LogLevel.SUCCESS, "SESSION",
                         "Target prepared · " + ((System.nanoTime() - started) / 1_000_000) + " ms");
-                return ActionResult.actionResult(HttpRequest.httpRequest(data.request().httpService(),
-                        Template.renderHttpRequest(data.request().toString(), variables)));
+                String targetTemplate = data.request().toString();
+                String renderedTarget = Template.renderHttpRequest(targetTemplate, variables);
+                return ActionResult.actionResult(renderedTarget.equals(targetTemplate) ? data.request()
+                        : HttpRequest.httpRequest(data.request().httpService(), ByteArray.byteArray(
+                                ByteTemplate.render(data.request().toByteArray().getBytes(), variables,
+                                        value -> ByteArray.byteArray(value).getBytes()))));
             } catch (Exception ex) {
                 api.logging().logToError("Session chain failed: " + ex.getMessage());
                 appendLog(LogLevel.ERROR, "SESSION", "Preparation failed · " + ex.getMessage());
@@ -1114,13 +1273,13 @@ public final class ChainExtension implements BurpExtension {
             try {
                 intruderChainRunning.set(true);
                 long started = System.nanoTime();
-                List<ChainStep> before = List.copyOf(steps.subList(0, intruderTargetIndex));
+                List<ChainStep> before = enabledSteps(List.copyOf(steps.subList(0, intruderTargetIndex)));
                 List<ChainEngine.Step> definitions = before.stream()
                         .map(step -> new ChainEngine.Step(step.requestTemplate, Map.copyOf(step.outputs))).toList();
-                Map<String, String> variables = ChainEngine.run(definitions, (index, raw) -> {
+                Map<String, String> variables = ChainEngine.run(definitions, (index, raw, resolvedVariables) -> {
                     long stepStarted = System.nanoTime();
                     ChainStep step = before.get(index);
-                    HttpRequestResponse result = api.http().sendRequest(HttpRequest.httpRequest(step.service, raw));
+                    HttpRequestResponse result = api.http().sendRequest(renderedStepRequest(step, raw, resolvedVariables));
                     if (!result.hasResponse()) return null;
                     step.lastResponse = result.response().toString();
                     step.lastResponseBody = result.response().bodyToString();
@@ -1128,8 +1287,12 @@ public final class ChainExtension implements BurpExtension {
                     return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
                 }, message -> appendLog("Intruder chain: " + message));
                 appendLog("Intruder chain preparation took " + ((System.nanoTime() - started) / 1_000_000) + " ms");
-                return RequestToBeSentAction.continueWith(HttpRequest.httpRequest(request.httpService(),
-                        Template.renderHttpRequest(request.toString(), variables)));
+                String targetTemplate = request.toString();
+                String renderedTarget = Template.renderHttpRequest(targetTemplate, variables);
+                return RequestToBeSentAction.continueWith(renderedTarget.equals(targetTemplate) ? request
+                        : HttpRequest.httpRequest(request.httpService(), ByteArray.byteArray(
+                                ByteTemplate.render(request.toByteArray().getBytes(), variables,
+                                        value -> ByteArray.byteArray(value).getBytes()))));
             } catch (Exception ex) {
                 api.logging().logToError("Intruder chain failed: " + ex.getMessage());
                 return RequestToBeSentAction.continueWith(request);
@@ -1243,11 +1406,19 @@ public final class ChainExtension implements BurpExtension {
 
     private final class StepTable extends AbstractTableModel {
         @Override public int getRowCount() { return steps.size(); }
-        @Override public int getColumnCount() { return 3; }
-        @Override public String getColumnName(int column) { return switch (column) { case 0 -> "Order"; case 1 -> "Request"; default -> "Variables from response"; }; }
+        @Override public int getColumnCount() { return 4; }
+        @Override public String getColumnName(int column) { return switch (column) { case 0 -> "Enabled"; case 1 -> "Order"; case 2 -> "Request"; default -> "Variables from response"; }; }
+        @Override public Class<?> getColumnClass(int column) { return column == 0 ? Boolean.class : column == 1 ? Integer.class : String.class; }
+        @Override public boolean isCellEditable(int row, int column) { return column == 0; }
+        @Override public void setValueAt(Object value, int row, int column) {
+            if (column != 0 || !(value instanceof Boolean enabled)) return;
+            steps.get(row).enabled = enabled;
+            refreshPointedTargetState();
+            fireTableRowsUpdated(row, row);
+        }
         @Override public Object getValueAt(int row, int column) {
             ChainStep step = steps.get(row);
-            return switch (column) { case 0 -> row + 1; case 1 -> step.url; default -> step.outputs.toString(); };
+            return switch (column) { case 0 -> step.enabled; case 1 -> row + 1; case 2 -> step.url; default -> step.outputs.toString(); };
         }
     }
 }

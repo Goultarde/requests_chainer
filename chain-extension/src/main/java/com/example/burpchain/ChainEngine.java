@@ -14,16 +14,23 @@ public final class ChainEngine {
     public record Step(String template, Map<String, String> outputs) {}
     public record Response(int status, String body) {}
     @FunctionalInterface public interface Sender { Response send(int stepIndex, String request) throws Exception; }
+    @FunctionalInterface public interface ContextSender {
+        Response send(int stepIndex, String request, Map<String, String> variables) throws Exception;
+    }
     @FunctionalInterface public interface Reporter { void report(String message); }
 
     private ChainEngine() {}
 
     public static Map<String, String> run(List<Step> steps, Sender sender, Reporter reporter) throws Exception {
+        return run(steps, (index, request, variables) -> sender.send(index, request), reporter);
+    }
+
+    public static Map<String, String> run(List<Step> steps, ContextSender sender, Reporter reporter) throws Exception {
         Map<String, String> variables = new LinkedHashMap<>();
         for (int i = 0; i < steps.size(); i++) {
             Step step = steps.get(i);
             String request = Template.renderHttpRequest(step.template(), variables);
-            Response response = sender.send(i, request);
+            Response response = sender.send(i, request, Map.copyOf(variables));
             if (response == null) throw new IOException("Step " + (i + 1) + " returned no response");
             if (response.status() >= 400) throw new IOException("Step " + (i + 1) + " returned HTTP " + response.status());
             for (Map.Entry<String, String> output : step.outputs().entrySet()) {

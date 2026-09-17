@@ -2,6 +2,8 @@
 
 Extension Java Montoya qui envoie des requêtes sélectionnées de l'historique dans l'ordre et récupère des variables dans les réponses JSON.
 
+Le bouton **Help** affiche l'adresse complète du [wiki Requests Chainer](https://github.com/Goultarde/requests_chainer/wiki), avec **Open in browser** et **Copy link**. L'adresse reste sélectionnable si aucun navigateur ne s'ouvre.
+
 ## Utilisation
 
 1. Dans **Proxy > HTTP history**, sélectionnez plusieurs requêtes, faites un clic droit et choisissez **Extensions > Requests Chainer > Add to Requests Chainer**. Les requêtes sélectionnées depuis l'historique Proxy sont ajoutées de la plus ancienne à la plus récente.
@@ -9,6 +11,8 @@ Extension Java Montoya qui envoie des requêtes sélectionnées de l'historique 
 3. Sélectionnez la première requête. Dans la réponse affichée à droite, surlignez la valeur de l'ID avec la souris et cliquez **Variable from selected response value**. Nommez-la `id`. Si la valeur apparaît plusieurs fois, choisissez son chemin JSON.
 4. Sélectionnez la requête qui utilisera l'ID. Surlignez l'ancien ID ou placez le curseur à l'endroit voulu dans la requête affichée à gauche. Cliquez **Insert variable at caret** et saisissez `id`. Le marqueur `{{id}}` peut aussi être tapé directement. Les modifications de la requête sont conservées lorsque vous changez d'étape.
 5. Cliquez **Run chain**. Le journal indique le code HTTP de chaque étape et les variables extraites. Une réponse HTTP 4xx/5xx, une variable absente ou un chemin JSON manquant arrête la chaîne.
+
+Pour ignorer temporairement une ou plusieurs requêtes, décochez leur case **Enabled** ou sélectionnez plusieurs lignes puis cliquez **Disable selected**. **Enable selected** les réactive. Leur état est conservé dans les fichiers `.rchain`; les anciens fichiers sont chargés avec toutes les requêtes activées. Les étapes désactivées sont aussi ignorées lors de la préparation d'une requête cible par la règle de session.
 
 Le JAR installé est `build/libs/burp-request-chain.jar`. Pour le reconstruire :
 

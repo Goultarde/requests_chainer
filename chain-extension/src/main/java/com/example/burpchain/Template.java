@@ -25,6 +25,7 @@ public final class Template {
 
     public static String renderHttpRequest(String raw, Map<String, String> values) {
         String rendered = render(raw, values);
+        if (rendered.equals(raw)) return raw;
         int separator = rendered.indexOf("\r\n\r\n");
         String newline = "\r\n";
         if (separator < 0) { separator = rendered.indexOf("\n\n"); newline = "\n"; }

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import java.util.Map;
 import java.util.List;
 import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
 import static org.junit.jupiter.api.Assertions.*;
 
 class CoreTest {
@@ -54,5 +55,54 @@ class CoreTest {
         String body = "Set-Cookie: __Secure-ENID=CpcABC_123; expires=Sat, 16-Oct-2027 09:26:57 GMT";
         assertEquals("CpcABC_123", ChainEngine.extract(body, "regex:\\-ENID=(.*?); expires="));
         assertEquals("CpcABC_123", ChainEngine.extract(body, "regexi:\\-enid=(.*?); EXPIRES="));
+    }
+    @Test void suggestedStartDoesNotBeginWithUnneededWhitespace() throws Exception {
+        String response = "HTTP/1.1 200 OK\r\n\r\n    token=abc123; expires=tomorrow";
+        String[] boundaries = DelimiterSuggestions.bestDelimiters(response, "abc123", response.indexOf("abc123"));
+        assertFalse(Character.isWhitespace(boundaries[0].charAt(0)));
+        String selector = "delim:" + java.util.Base64.getUrlEncoder().encodeToString(boundaries[0].getBytes())
+                + "." + java.util.Base64.getUrlEncoder().encodeToString(boundaries[1].getBytes());
+        assertEquals("abc123", ChainEngine.extract(response, selector));
+    }
+    @Test void suggestedStartUsesSelectedOccurrence() throws Exception {
+        String response = "first-token=abc; expires=tomorrow\r\nsecond-token=abc; expires=tomorrow";
+        String[] boundaries = DelimiterSuggestions.bestDelimiters(response, "abc", response.lastIndexOf("abc"));
+        assertTrue(response.indexOf(boundaries[0]) >= response.indexOf("second-token="));
+        String selector = "delim:" + java.util.Base64.getUrlEncoder().encodeToString(boundaries[0].getBytes())
+                + "." + java.util.Base64.getUrlEncoder().encodeToString(boundaries[1].getBytes());
+        assertEquals("abc", ChainEngine.extract(response, selector));
+    }
+    @Test void insertingVariablePreservesNonUtf8AndUtf8BytesOutsideSelection() {
+        for (byte[] accent : List.of(new byte[]{(byte) 0xe9}, "é".getBytes(StandardCharsets.UTF_8))) {
+            byte[] prefix = "POST / HTTP/1.1\r\n\r\nname=".getBytes(StandardCharsets.US_ASCII);
+            byte[] suffix = "&id=OLD&note=".getBytes(StandardCharsets.US_ASCII);
+            byte[] original = new byte[prefix.length + accent.length + suffix.length + accent.length];
+            System.arraycopy(prefix, 0, original, 0, prefix.length);
+            System.arraycopy(accent, 0, original, prefix.length, accent.length);
+            System.arraycopy(suffix, 0, original, prefix.length + accent.length, suffix.length);
+            System.arraycopy(accent, 0, original, prefix.length + accent.length + suffix.length, accent.length);
+            int start = prefix.length + accent.length + "&id=".length();
+            byte[] result = ByteSplice.replace(original, start, start + 3, "{{id}}".getBytes(StandardCharsets.US_ASCII));
+            assertArrayEquals(accent, java.util.Arrays.copyOfRange(result, prefix.length, prefix.length + accent.length));
+            assertArrayEquals(accent, java.util.Arrays.copyOfRange(result, result.length - accent.length, result.length));
+        }
+    }
+    @Test void renderingVariablesPreservesOriginalRequestBytesAndSetsByteLength() {
+        for (byte[] accent : List.of(new byte[]{(byte) 0xe9}, "é".getBytes(StandardCharsets.UTF_8))) {
+            byte[] head = "POST / HTTP/1.1\r\nContent-Length: 0\r\n\r\nname=".getBytes(StandardCharsets.US_ASCII);
+            byte[] tail = "&id={{id}}".getBytes(StandardCharsets.US_ASCII);
+            byte[] template = new byte[head.length + accent.length + tail.length];
+            System.arraycopy(head, 0, template, 0, head.length);
+            System.arraycopy(accent, 0, template, head.length, accent.length);
+            System.arraycopy(tail, 0, template, head.length + accent.length, tail.length);
+            byte[] rendered = ByteTemplate.render(template, Map.of("id", "42"),
+                    value -> value.getBytes(StandardCharsets.US_ASCII));
+            String text = new String(rendered, StandardCharsets.ISO_8859_1);
+            assertTrue(text.contains("Content-Length: " + ("name=&id=42".length() + accent.length)));
+            int body = text.indexOf("\r\n\r\n") + 4;
+            assertArrayEquals(accent, java.util.Arrays.copyOfRange(rendered, body + "name=".length(),
+                    body + "name=".length() + accent.length));
+            assertTrue(text.endsWith("&id=42"));
+        }
     }
 }
