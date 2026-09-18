@@ -100,6 +100,7 @@ public final class ChainExtension implements BurpExtension {
     private final JSpinner repetitionCount = new JSpinner(new SpinnerNumberModel(1, 1, 1000, 1));
     private final Deque<byte[]> requestUndo = new ArrayDeque<>();
     private java.io.File lastChainDirectory;
+    private java.io.File lastLogDirectory;
     private final TabActivityIndicator tabActivity = new TabActivityIndicator();
     private javax.swing.Timer trafficTimer;
     private boolean tabIndicatorFailureLogged;
@@ -119,6 +120,8 @@ public final class ChainExtension implements BurpExtension {
         root.setPreferredSize(new java.awt.Dimension(1200, 800));
         JButton up = new JButton("Move up");
         JButton down = new JButton("Move down");
+        up.setToolTipText("Move the selected request up (Shift+Up in the request list)");
+        down.setToolTipText("Move the selected request down (Shift+Down in the request list)");
         JButton disable = new JButton("Disable selected");
         JButton enable = new JButton("Enable selected");
         JButton remove = new JButton("Remove");
@@ -179,6 +182,23 @@ public final class ChainExtension implements BurpExtension {
         table.setRowHeight(Math.max(26, table.getRowHeight()));
         table.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
         table.setFillsViewportHeight(true);
+        table.setShowVerticalLines(true);
+        table.setShowHorizontalLines(true);
+        table.setIntercellSpacing(new java.awt.Dimension(1, 1));
+        updateStepTableGridColor();
+        table.addPropertyChangeListener("UI", event -> updateStepTableGridColor());
+        javax.swing.table.TableCellRenderer headerRenderer = table.getTableHeader().getDefaultRenderer();
+        Component headerSample = headerRenderer.getTableCellRendererComponent(table, "", false, false, -1, 0);
+        javax.swing.border.Border headerBorder = headerSample instanceof JComponent component
+                ? component.getBorder() : null;
+        table.getTableHeader().setDefaultRenderer((owner, value, selected, focused, row, column) -> {
+            Component header = headerRenderer.getTableCellRendererComponent(owner, value, selected, focused, row, column);
+            if (header instanceof JComponent component) {
+                component.setBorder(BorderFactory.createCompoundBorder(headerBorder,
+                        BorderFactory.createMatteBorder(0, 0, 0, 1, table.getGridColor())));
+            }
+            return header;
+        });
         table.getColumnModel().getColumn(0).setPreferredWidth(68);
         table.getColumnModel().getColumn(0).setMaxWidth(85);
         table.getColumnModel().getColumn(1).setPreferredWidth(55);
@@ -216,10 +236,14 @@ public final class ChainExtension implements BurpExtension {
                     new StringSelection(log.getText()), null);
             status.setText("Activity log copied.");
         });
+        JButton saveLog = new JButton("Save log");
+        saveLog.setToolTipText("Save the activity log shown below as a UTF-8 .log file");
+        saveLog.addActionListener(e -> saveActivityLog());
         JButton clearLog = new JButton("Clear log");
         clearLog.addActionListener(e -> log.setText(""));
         JPanel logActions = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
         logActions.add(copyLog);
+        logActions.add(saveLog);
         logActions.add(clearLog);
         logHeader.add(logActions, BorderLayout.EAST);
         JPanel logTop = new JPanel(new BorderLayout());
@@ -254,6 +278,14 @@ public final class ChainExtension implements BurpExtension {
         table.getSelectionModel().addListSelectionListener(e -> { if (!e.getValueIsAdjusting()) showSelected(); });
         table.setRowSelectionAllowed(true);
         table.setColumnSelectionAllowed(false);
+        table.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke("shift UP"), "requests-chainer-move-up");
+        table.getInputMap(JComponent.WHEN_FOCUSED).put(KeyStroke.getKeyStroke("shift DOWN"), "requests-chainer-move-down");
+        table.getActionMap().put("requests-chainer-move-up", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { move(-1); }
+        });
+        table.getActionMap().put("requests-chainer-move-down", new AbstractAction() {
+            @Override public void actionPerformed(java.awt.event.ActionEvent event) { move(1); }
+        });
         table.addMouseListener(new java.awt.event.MouseAdapter() {
             @Override public void mousePressed(java.awt.event.MouseEvent e) { showTablePopup(e); }
             @Override public void mouseReleased(java.awt.event.MouseEvent e) { showTablePopup(e); }
@@ -312,6 +344,20 @@ public final class ChainExtension implements BurpExtension {
         label.setFont(label.getFont().deriveFont(Font.BOLD));
         label.setBorder(BorderFactory.createEmptyBorder(3, 5, 3, 5));
         return label;
+    }
+
+    private void updateStepTableGridColor() {
+        Color background = table.getBackground();
+        Color foreground = table.getForeground();
+        if (background == null || foreground == null) return;
+        // Derive the divider from Burp's current theme, with enough contrast on both light and dark tables.
+        double foregroundWeight = 0.35;
+        int red = (int) Math.round(background.getRed() * (1 - foregroundWeight) + foreground.getRed() * foregroundWeight);
+        int green = (int) Math.round(background.getGreen() * (1 - foregroundWeight) + foreground.getGreen() * foregroundWeight);
+        int blue = (int) Math.round(background.getBlue() * (1 - foregroundWeight) + foreground.getBlue() * foregroundWeight);
+        table.setGridColor(new Color(red, green, blue));
+        table.repaint();
+        if (table.getTableHeader() != null) table.getTableHeader().repaint();
     }
 
     private JPanel editorPanel(String title, Component editor) {
@@ -1375,6 +1421,36 @@ public final class ChainExtension implements BurpExtension {
             log.setCaretPosition(document.getLength());
         } catch (javax.swing.text.BadLocationException ex) {
             api.logging().logToError("Activity log update failed: " + ex.getMessage());
+        }
+    }
+
+    private void saveActivityLog() {
+        String contents = log.getText();
+        if (contents.isEmpty()) {
+            status.setText("The activity log is empty.");
+            return;
+        }
+        JFileChooser chooser = new JFileChooser();
+        chooser.setDialogTitle("Save Requests Chainer activity log");
+        chooser.setFileFilter(new javax.swing.filechooser.FileNameExtensionFilter("Log files (*.log)", "log"));
+        if (lastLogDirectory != null) chooser.setCurrentDirectory(lastLogDirectory);
+        String timestamp = java.time.LocalDateTime.now().format(
+                java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss"));
+        chooser.setSelectedFile(new java.io.File("requests-chainer-" + timestamp + ".log"));
+        if (chooser.showSaveDialog(suiteTab) != JFileChooser.APPROVE_OPTION) return;
+        java.io.File file = chooser.getSelectedFile();
+        if (!file.getName().toLowerCase(java.util.Locale.ROOT).endsWith(".log"))
+            file = new java.io.File(file.getParentFile(), file.getName() + ".log");
+        if (file.exists() && JOptionPane.showConfirmDialog(suiteTab,
+                "Replace the existing file " + file.getName() + "?", "Overwrite activity log",
+                JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) return;
+        try {
+            java.nio.file.Files.writeString(file.toPath(), contents, StandardCharsets.UTF_8);
+            lastLogDirectory = file.getParentFile();
+            status.setText("Activity log saved: " + file.getName());
+            status.setToolTipText(file.getAbsolutePath());
+        } catch (IOException ex) {
+            error("Cannot save activity log: " + ex.getMessage());
         }
     }
     private void error(String message) { JOptionPane.showMessageDialog(null, message, "Requests Chainer", JOptionPane.ERROR_MESSAGE); }
