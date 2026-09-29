@@ -47,6 +47,59 @@ class AutoChainFinderTest {
         assertEquals(List.of(2,3), plan.steps().stream().map(s -> s.capture().id()).toList());
     }
 
+    @Test void selectedDiscoveryOnlyReturnsDirectSourcesAndLeavesOtherOccurrencesUntouched() throws Exception {
+        byte[] target = request("/finish/ticket-second123?copy=ticket-second123&session=session-first123");
+        var history = List.of(
+            new AutoChainFinder.Capture(1,"local","start",request("/start"),response("{\"session\":\"session-first123\"}")),
+            new AutoChainFinder.Capture(2,"local","middle",request("/middle?session=session-first123"),response("{\"ticket\":\"ticket-second123\"}")),
+            new AutoChainFinder.Capture(3,"local","target",target,response("{}")));
+        int start = new String(target, LATIN1).indexOf("ticket-second123");
+        var matches = new AutoChainFinder(history).findSelectionSources(2, start, start + "ticket-second123".length());
+        assertEquals(List.of(2), matches.stream().map(m -> m.capture().id()).toList());
+        byte[] template = ByteSplice.replace(target, start, start + "ticket-second123".length(), "{{chosen|bytes}}".getBytes(UTF8));
+        byte[] extracted = AutoValue.extract(response("{\"ticket\":\"ticket-new456789\"}"), matches.getFirst().selector());
+        byte[] rendered = ByteTemplate.render(template, Map.of("chosen", Base64.getEncoder().encodeToString(extracted)), s -> s.getBytes(UTF8));
+        String view = new String(rendered, LATIN1);
+        assertTrue(view.contains("/finish/ticket-new456789?copy=ticket-second123&session=session-first123"));
+        assertArrayEquals(request("/middle?session=session-first123"), matches.getFirst().capture().request());
+    }
+
+    @Test void selectedDiscoveryOffersAmbiguousShortValuesButExcludesLateAndForeignSources() throws Exception {
+        byte[] target = request("/value/42");
+        var history = List.of(
+            new AutoChainFinder.Capture(1,"local","first",request("/first"),response("{\"id\":42}")),
+            new AutoChainFinder.Capture(2,"local","second",request("/second"),response("{\"id\":42}")),
+            new AutoChainFinder.Capture(3,"foreign","foreign",request("/foreign"),response("{\"id\":42}")),
+            new AutoChainFinder.Capture(4,"local","late",request("/late"),response("{\"id\":42}"), 35, 99),
+            new AutoChainFinder.Capture(5,"local","target",target,response("{}")));
+        int start = new String(target, LATIN1).indexOf("42");
+        var finder = new AutoChainFinder(history);
+        assertEquals(List.of(2,1), finder.findSelectionSources(4,start,start+2).stream().map(m -> m.capture().id()).toList());
+        assertTrue(finder.findSelectionSources(4,start,start+1).isEmpty());
+        assertThrows(IOException.class, () -> finder.findSelectionSources(4,start,start));
+    }
+
+    @Test void selectedDiscoveryPreservesBinaryAndEncodedUnicodeValues() throws Exception {
+        byte[] binary = {0, (byte)255, (byte)128, 1, 2, 3, 4, 5};
+        byte[] rawResponse = ByteSplice.replace("HTTP/1.1 200 OK\r\n\r\n".getBytes(UTF8),19,19,binary);
+        byte[] target = ByteSplice.replace(request("/binary"),request("/binary").length,request("/binary").length,binary);
+        var history = List.of(
+            new AutoChainFinder.Capture(1,"local","binary",request("/source"),rawResponse),
+            new AutoChainFinder.Capture(2,"local","target",target,response("{}")));
+        var found = new AutoChainFinder(history).findSelectionSources(1,target.length-binary.length,target.length);
+        assertEquals(1,found.size());
+        assertArrayEquals(binary,AutoValue.extract(rawResponse,found.getFirst().selector()));
+        String encoded = new String(AutoValue.transform("élément / 雪".getBytes(UTF8),"url"),UTF8);
+        byte[] unicodeTarget = request("/"+encoded);
+        byte[] unicodeResponse = response("{\"name\":\"élément / 雪\"}");
+        var unicodeHistory = List.of(
+            new AutoChainFinder.Capture(1,"local","source",request("/source"),unicodeResponse),
+            new AutoChainFinder.Capture(2,"local","target",unicodeTarget,response("{}")));
+        var unicode = new AutoChainFinder(unicodeHistory).findSelectionSources(1,5,5+encoded.length());
+        assertEquals(1,unicode.size());
+        assertArrayEquals(encoded.getBytes(UTF8),AutoValue.extract(unicodeResponse,unicode.getFirst().selector()));
+    }
+
     @Test void decodesChunkedGzipJsonAndExtractsEscapedPointer() throws Exception {
         ByteArrayOutputStream compressed = new ByteArrayOutputStream();
         try (var gzip = new GZIPOutputStream(compressed)) { gzip.write("{\"nested\":[{\"access/ticket\":\"value-12345678\"}]}".getBytes(UTF8)); }
@@ -88,27 +141,32 @@ class AutoChainFinderTest {
             BufferedReader reader = process.inputReader();
             int port = Integer.parseInt(reader.readLine());
             List<AutoChainFinder.Capture> history = new ArrayList<>();
+            noise(port, history);
             byte[] start = capture(port,history,"GET","/flow/start",Map.of(),new byte[0]);
             var context = AutoValue.JSON.readTree(AutoValue.message(start).body()).at("/data/context");
             String sid=context.get("session").asText(),csrf=context.get("csrf").asText(),label=context.get("label").asText();
-            capture(port,history,"GET","/flow/noise",Map.of(),new byte[0]);
+            noise(port, history);
             byte[] challengeResponse = capture(port,history,"GET","/flow/challenge?session="+sid,Map.of("X-CSRF",csrf),new byte[0]);
             var challenge = AutoValue.message(challengeResponse);
             String cookie=challenge.headers().get("set-cookie").getFirst().split(";",2)[0];
+            noise(port, history);
             byte[] answer = capture(port,history,"POST","/flow/answer?session="+sid,Map.of("X-CSRF",csrf,"Cookie",cookie,"Content-Type","application/octet-stream"),challenge.body());
             var answerMessage = AutoValue.message(answer);
             String ticket=AutoValue.JSON.readTree(AutoValue.decoded(answerMessage,"http")).at("/data/grants/0/access~1ticket").asText();
             String receipt=answerMessage.headers().get("x-receipt").getFirst();
+            noise(port, history);
             byte[] profileResponse=capture(port,history,"GET","/flow/profile?session="+sid,Map.of("X-CSRF",csrf),new byte[0]);
             String profile=AutoValue.JSON.readTree(AutoValue.message(profileResponse).body()).at("/data/profile/id").asText();
+            noise(port, history);
             byte[] reserveBody=AutoValue.JSON.writeValueAsBytes(Map.of("session",sid,"credentials",Map.of("ticket",ticket)));
             String encodedLabel=new String(AutoValue.transform(label.getBytes(UTF8),"url"),UTF8);
             byte[] reservationResponse=capture(port,history,"POST","/flow/reserve/"+encodedLabel,Map.of("X-CSRF",csrf,"Content-Type","application/json"),reserveBody);
             String reservation=AutoValue.JSON.readTree(AutoValue.message(reservationResponse).body()).at("/result/reservation/id").asText();
-            capture(port,history,"GET","/flow/noise",Map.of(),new byte[0]);
+            noise(port, history);
             byte[] finalBody=AutoValue.JSON.writeValueAsBytes(Map.of("session",sid,"profile",profile,"credentials",Map.of("ticket",ticket)));
             capture(port,history,"POST","/flow/finish/"+reservation,Map.of("X-Receipt",receipt,"Content-Type","application/json"),finalBody);
             var plan = new AutoChainFinder(history).find(history.size()-1);
+            assertEquals(30, history.size());
             assertEquals(6,plan.steps().size(),plan.links().toString());
             assertFalse(plan.steps().stream().anyMatch(s -> s.capture().label().contains("noise")));
             assertTrue(plan.links().stream().anyMatch(l -> l.description().contains("Complete body (wire)")));
@@ -132,6 +190,9 @@ class AutoChainFinderTest {
                 assertFalse(Arrays.equals(challenge.body(),AutoValue.message(responses.get(1)).body()));
             }
         } finally { process.destroy(); if(!process.waitFor(3,java.util.concurrent.TimeUnit.SECONDS)) process.destroyForcibly(); }
+    }
+    private static void noise(int port, List<AutoChainFinder.Capture> history) throws Exception {
+        for (int i = 0; i < 4; i++) capture(port, history, "GET", "/flow/noise?sample=" + i, Map.of(), new byte[0]);
     }
     private static int status(byte[] response) { return Integer.parseInt(new String(response,0,32,LATIN1).split(" ")[1]); }
     private static byte[] capture(int port,List<AutoChainFinder.Capture> captures,String method,String path,Map<String,String> headers,byte[] body) throws Exception {

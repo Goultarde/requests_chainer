@@ -35,9 +35,18 @@ L'analyse remonte récursivement les réponses précédentes du même protocole/
 
 Il s'agit d'une inférence : la correspondance d'une valeur ne prouve pas qu'une étape est nécessaire. La réponse précédente la plus récente est privilégiée. Une dépendance purement côté serveur sans valeur réutilisée, une transformation cryptographique, du trafic non capturé ou provenant d'une autre origine ne peut pas être déduite. Les valeurs de moins de six octets sont ignorées pour limiter les faux positifs. Les limites de travail sont signalées dans le journal : 2000 échanges/64 MiB d'historique, 2 MiB par message ou après décompression, 100 étapes et 512 candidats par réponse.
 
+### Recherche ciblée depuis une sélection
+
+1. Sélectionnez une requête capturée dans la chaîne et surlignez sa valeur dans l'éditeur **Request** (vue **Raw**, sans les guillemets JSON).
+2. Cliquez **Find source for selection**, à côté de **Automate chain finding**.
+3. Choisissez la réponse source proposée : la liste donne le numéro d'historique, la requête et l'extracteur. Les sources les plus récentes apparaissent en premier ; plusieurs correspondances restent un choix explicite.
+4. La requête source est insérée immédiatement avant la requête actuelle. Seule la plage surlignée devient `{{auto_selected_N|bytes}}`, même si la valeur apparaît ailleurs.
+
+Cette recherche ne remonte pas récursivement les dépendances de la source et n'envoie aucun trafic. Répétez l'opération sur la requête insérée si elle nécessite elle-même une valeur préalable. Les valeurs courtes sont acceptées dans ce mode explicite. Les extracteurs, encodages et limites d'historique sont ceux de la recherche complète ; le contenu sélectionné doit correspondre à une valeur complète reconnue. Annuler le choix ne modifie pas la chaîne. La recherche conserve la requête capturée d'origine en mémoire, ce qui permet de traiter plusieurs valeurs après une première insertion. Après rechargement d'une chaîne modifiée, la requête originale peut devoir être réimportée depuis l'historique.
+
 ### Scénario complexe
 
-Sur la page d'accueil de l'application de test, cliquez **Run complex demo**. Cette partie utilise JavaScript. Elle capture six étapes utiles et deux requêtes parasites :
+Sur la page d'accueil de l'application de test, cliquez **Run complex demo**. Cette partie utilise JavaScript. Elle capture six étapes utiles et 24 requêtes parasites :
 
 - `/flow/start` : nouvelle session, CSRF et valeur UTF-8 ;
 - `/flow/challenge` : corps gzip contenant un challenge binaire non UTF-8, et cookie ;
@@ -46,7 +55,9 @@ Sur la page d'accueil de l'application de test, cliquez **Run complex demo**. Ce
 - `/flow/reserve/...` : valeur UTF-8 encodée dans l'URL, ticket dans un objet JSON ;
 - `/flow/finish/...` : réunion des dépendances, consommation de la session.
 
-Envoyez seulement **POST /flow/finish/...** à l'extension, puis utilisez **Automate chain finding**. Un rejeu correct doit reconstruire la session et le challenge : la session initiale est déjà consommée. La suite de tests démarre une instance isolée sur un port aléatoire, découvre les six étapes et vérifie deux rejeux avec des valeurs renouvelées.
+Envoyez seulement **POST /flow/finish/...** à l'extension, puis utilisez **Automate chain finding**. Un rejeu correct doit reconstruire la session et le challenge : la session initiale est déjà consommée. Chaque réponse JSON contient aussi 36 objets parasites imbriqués, avec de faux identifiants, des clés échappées et du texte Unicode. Les réponses parasites contiennent des identifiants réels altérés d’un caractère. Le challenge contient 4096 octets aléatoires, et la valeur d’URL mêle accents, caractères asiatiques, espaces et symboles.
+
+La suite de tests démarre une instance isolée sur un port aléatoire, découvre les six étapes et vérifie deux rejeux avec des valeurs renouvelées.
 
 ### Scénario simple existant
 

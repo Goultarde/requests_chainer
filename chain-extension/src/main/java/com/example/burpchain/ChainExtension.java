@@ -139,6 +139,9 @@ public final class ChainExtension implements BurpExtension {
         JButton automate = new JButton("Automate chain finding");
         automate.setToolTipText("Build a new chain from preceding responses in same-origin Proxy history");
         automate.addActionListener(e -> automateChainFinding());
+        JButton findSelection = new JButton("Find source for selection");
+        findSelection.setToolTipText("Find a prior response containing the selected request value, then choose one source to insert");
+        findSelection.addActionListener(e -> findSourceForSelection());
         JButton deleteVariable = new JButton("Delete variable");
         JButton editVariable = new JButton("Edit variable");
         JButton replaceAll = new JButton("Replace in all requests");
@@ -149,6 +152,7 @@ public final class ChainExtension implements BurpExtension {
         chainSelector.addItem(currentChainName);
         stylePrimaryButton(run, new Color(0xD96A1D));
         stylePrimaryButton(variable, new Color(0x286EAC));
+        stylePrimaryButton(automate, new Color(0x287A48));
         run.setToolTipText("Execute all requests in order (Ctrl+Alt+R)");
         intruder.setToolTipText("Use the selected request as the Intruder target (Ctrl+I)");
         repeater.setToolTipText("Open the selected request(s) in Burp Repeater (Ctrl+R)");
@@ -167,7 +171,7 @@ public final class ChainExtension implements BurpExtension {
         Color separator = javax.swing.UIManager.getColor("Separator.foreground");
         top.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0,
                 separator != null ? separator : Color.GRAY));
-        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain, automate, help));
+        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain, automate, findSelection, help));
         top.add(toolbarRow("RUN", run, new JLabel("Runs:"), repetitionCount, clear, intruder, repeater, pointRequest, sessionRule));
         top.add(toolbarRow("VARIABLES", new JLabel("Find:"), variableSearch, variableBox, insert, variable, editVariable, deleteVariable));
         top.add(toolbarRow("EDIT", save, replaceAll, propagateHeader));
@@ -663,66 +667,164 @@ public final class ChainExtension implements BurpExtension {
                 ? timing.timeRequestSent().toInstant() : item.time().toInstant();
     }
 
+    private record CapturedHistory(List<AutoChainFinder.Capture> captures, List<String> warnings) {}
+
+    private CapturedHistory capturedHistory(ChainStep target, byte[] targetBytes) throws IOException {
+        String origin = target.service.host() + ":" + target.service.port() + ":" + target.service.secure();
+        var history = new ArrayList<>(api.proxy().history());
+        history.sort(java.util.Comparator.comparing(ChainExtension::captureTime)
+                .thenComparingInt(burp.api.montoya.proxy.ProxyHttpRequestResponse::id));
+        int targetAt = -1;
+        int equalTargets = 0;
+        for (int i = history.size() - 1; i >= 0; i--) {
+            var item = history.get(i);
+            var service = item.httpService();
+            String itemOrigin = service.host() + ":" + service.port() + ":" + service.secure();
+            HttpRequest sent = item.finalRequest() == null ? item.request() : item.finalRequest();
+            if (origin.equals(itemOrigin) && java.util.Arrays.equals(targetBytes, sent.toByteArray().getBytes())) {
+                equalTargets++;
+                if (targetAt < 0) targetAt = i;
+                if (target.capturedAt != null && item.timingData() != null
+                        && target.capturedAt.equals(captureTime(item))) {
+                    targetAt = i; equalTargets = 1; break;
+                }
+            }
+        }
+        if (targetAt < 0) throw new IOException("Target not found in Proxy history. Add the original captured request before editing it.");
+        List<AutoChainFinder.Capture> captures = new ArrayList<>();
+        long totalBytes = 0;
+        boolean limited = false;
+        for (int i = targetAt; i >= 0; i--) {
+            var item = history.get(i);
+            var service = item.httpService();
+            String itemOrigin = service.host() + ":" + service.port() + ":" + service.secure();
+            if (!origin.equals(itemOrigin)) continue;
+            if (!item.hasResponse() && i != targetAt) continue;
+            HttpRequest sent = item.finalRequest() == null ? item.request() : item.finalRequest();
+            byte[] request = sent.toByteArray().getBytes();
+            byte[] response = item.hasResponse() ? item.response().toByteArray().getBytes() : new byte[0];
+            totalBytes += request.length + response.length;
+            if (captures.size() >= 2000 || totalBytes > 64L * 1024 * 1024) { limited = true; break; }
+            long sentAt = captureTime(item).toEpochMilli();
+            long completedAt = sentAt;
+            if (item.timingData() != null) {
+                var duration = item.timingData().timeBetweenRequestSentAndEndOfResponse();
+                completedAt = sentAt + (duration == null ? 0 : duration.toMillis());
+            }
+            captures.add(new AutoChainFinder.Capture(item.id(), itemOrigin, sent.method() + " " + sent.url(),
+                    request, response, sentAt, completedAt));
+        }
+        if (captures.isEmpty()) throw new IOException("Target exceeds the 64 MiB capture limit.");
+        java.util.Collections.reverse(captures);
+        List<String> warnings = new ArrayList<>();
+        if (equalTargets > 1) warnings.add("Several identical targets were captured; the latest one was used.");
+        if (limited) warnings.add("Analysis used the most recent 2000 same-origin entries, up to 64 MiB.");
+        return new CapturedHistory(List.copyOf(captures), List.copyOf(warnings));
+    }
+
+    private void findSourceForSelection() {
+        if (running || findingChain) { error("Wait for the current operation to finish"); return; }
+        ChainStep target = selectedStep();
+        var selection = requestEditor.selection().orElse(null);
+        if (target == null || table.getSelectedRowCount() != 1 || selection == null) {
+            error("Select one request, then highlight the value to find in its request editor"); return;
+        }
+        int start = selection.offsets().startIndexInclusive();
+        int end = selection.offsets().endIndexExclusive();
+        byte[] current = requestEditor.getRequest().toByteArray().getBytes();
+        if (start < 0 || end <= start || end > current.length
+                || !java.util.Arrays.equals(selection.contents().getBytes(), java.util.Arrays.copyOfRange(current, start, end))) {
+            error("Select the value in the Raw request view so the byte range matches the request"); return;
+        }
+        saveSelected();
+        String chainName = currentChainName;
+        List<ChainStep> originalSteps = List.copyOf(steps);
+        byte[] lookup = target.capturedRequestBytes == null ? current.clone() : target.capturedRequestBytes.clone();
+        findingChain = true;
+        status.setText("Finding prior responses for the selected value...");
+        new SwingWorker<List<AutoChainFinder.SelectionSource>, Void>() {
+            final List<String> warnings = new ArrayList<>();
+            @Override protected List<AutoChainFinder.SelectionSource> doInBackground() throws Exception {
+                CapturedHistory captured = capturedHistory(target, lookup);
+                warnings.addAll(captured.warnings());
+                List<AutoChainFinder.Capture> captures = new ArrayList<>(captured.captures());
+                var last = captures.getLast();
+                captures.set(captures.size() - 1, new AutoChainFinder.Capture(last.id(), last.origin(), last.label(),
+                        current, last.response(), last.sentAt(), last.completedAt()));
+                AutoChainFinder finder = new AutoChainFinder(captures);
+                var matches = finder.findSelectionSources(captures.size() - 1, start, end);
+                warnings.addAll(finder.discoveryWarnings());
+                return matches;
+            }
+            @Override protected void done() {
+                try {
+                    var matches = get();
+                    for (String warning : warnings) appendLog(LogLevel.WARNING, "DISCOVERY", warning);
+                    if (matches.isEmpty()) {
+                        status.setText("No source found for the selected value.");
+                        error("No prior same-origin response contains this complete value in a supported extractor. Select the value without surrounding quotes. See the log for analysis limits.");
+                        return;
+                    }
+                    if (!chainName.equals(currentChainName) || !originalSteps.equals(steps)
+                            || selectedStep() != target || !java.util.Arrays.equals(current, target.requestBytes)
+                            || !java.util.Arrays.equals(current, requestEditor.getRequest().toByteArray().getBytes())) {
+                        error("The chain or request changed during discovery. Select the value and try again."); return;
+                    }
+                    var chosen = (AutoChainFinder.SelectionSource) JOptionPane.showInputDialog(suiteTab,
+                            "Choose a source to insert immediately before this request.\n"
+                            + "Only the highlighted range will become a variable.\n"
+                            + "The source request's own dependencies will not be discovered.",
+                            "Find source for selection", JOptionPane.QUESTION_MESSAGE, null,
+                            matches.toArray(), matches.getFirst());
+                    if (chosen == null) { status.setText("Source selection cancelled."); return; }
+                    java.util.Set<String> names = new java.util.HashSet<>();
+                    steps.forEach(step -> names.addAll(step.outputs.keySet()));
+                    String name = "auto_selected_1";
+                    for (int n = 2; names.contains(name); n++) name = "auto_selected_" + n;
+                    var capture = chosen.capture();
+                    HttpRequest original = HttpRequest.httpRequest(target.service, ByteArray.byteArray(capture.request()));
+                    var response = burp.api.montoya.http.message.responses.HttpResponse.httpResponse(ByteArray.byteArray(capture.response()));
+                    ChainStep source = new ChainStep(HttpRequestResponse.httpRequestResponse(original, response));
+                    source.capturedAt = java.time.Instant.ofEpochMilli(capture.sentAt());
+                    source.outputs.put(name, chosen.selector());
+                    byte[] changed = ByteSplice.replace(current, start, end,
+                            ("{{" + name + "|bytes}}").getBytes(StandardCharsets.US_ASCII));
+                    target.setRequest(HttpRequest.httpRequest(target.service, ByteArray.byteArray(changed)));
+                    int targetRow = steps.indexOf(target);
+                    steps.add(targetRow, source);
+                    displayedStep = null;
+                    intruderChainEnabled = false; intruderTargetUrl = null;
+                    model.fireTableDataChanged(); refreshVariables();
+                    table.setRowSelectionInterval(targetRow + 1, targetRow + 1);
+                    showSelected();
+                    storeCurrentChain();
+                    appendLog(LogLevel.SUCCESS, "DISCOVERY", "Inserted history #" + capture.id() + " before step "
+                            + (targetRow + 2) + " · " + name + " · " + chosen.description());
+                    status.setText("Source inserted; only the selected value was replaced. Review its own dependencies before running.");
+                } catch (Exception ex) {
+                    Throwable cause = ex.getCause() == null ? ex : ex.getCause();
+                    status.setText("Source discovery failed.");
+                    error("Cannot find source: " + cause.getMessage());
+                } finally { findingChain = false; }
+            }
+        }.execute();
+    }
+
     private void automateChainFinding() {
         if (running || findingChain) { error("Wait for the current operation to finish"); return; }
         if (table.getSelectedRowCount() != 1) { error("Select exactly one captured target request"); return; }
         saveSelected();
         ChainStep target = selectedStep();
         byte[] targetBytes = target.requestBytes.clone();
-        String origin = target.service.host() + ":" + target.service.port() + ":" + target.service.secure();
         findingChain = true;
         status.setText("Finding dependencies in captured Proxy history...");
         new SwingWorker<AutoChainFinder.Plan, Void>() {
             @Override protected AutoChainFinder.Plan doInBackground() throws Exception {
-                var history = new ArrayList<>(api.proxy().history());
-                history.sort(java.util.Comparator.comparing(ChainExtension::captureTime)
-                        .thenComparingInt(burp.api.montoya.proxy.ProxyHttpRequestResponse::id));
-                int targetAt = -1;
-                int equalTargets = 0;
-                for (int i = history.size() - 1; i >= 0; i--) {
-                    var item = history.get(i);
-                    var service = item.httpService();
-                    String itemOrigin = service.host() + ":" + service.port() + ":" + service.secure();
-                    HttpRequest sent = item.finalRequest() == null ? item.request() : item.finalRequest();
-                    if (origin.equals(itemOrigin) && java.util.Arrays.equals(targetBytes, sent.toByteArray().getBytes())) {
-                        equalTargets++;
-                        if (targetAt < 0) targetAt = i;
-                        if (target.capturedAt != null && item.timingData() != null
-                                && target.capturedAt.equals(captureTime(item))) {
-                            targetAt = i; equalTargets = 1; break;
-                        }
-                    }
-                }
-                if (targetAt < 0) throw new IOException("Target not found in Proxy history. Add the original captured request before editing it.");
-                List<AutoChainFinder.Capture> captures = new ArrayList<>();
-                long totalBytes = 0;
-                boolean limited = false;
-                for (int i = targetAt; i >= 0; i--) {
-                    var item = history.get(i);
-                    var service = item.httpService();
-                    String itemOrigin = service.host() + ":" + service.port() + ":" + service.secure();
-                    if (!origin.equals(itemOrigin)) continue;
-                    if (!item.hasResponse() && i != targetAt) continue;
-                    HttpRequest sent = item.finalRequest() == null ? item.request() : item.finalRequest();
-                    byte[] request = sent.toByteArray().getBytes();
-                    byte[] response = item.hasResponse() ? item.response().toByteArray().getBytes() : new byte[0];
-                    totalBytes += request.length + response.length;
-                    if (captures.size() >= 2000 || totalBytes > 64L * 1024 * 1024) { limited = true; break; }
-                    long sentAt = captureTime(item).toEpochMilli();
-                    long completedAt = sentAt;
-                    if (item.timingData() != null) {
-                        var duration = item.timingData().timeBetweenRequestSentAndEndOfResponse();
-                        completedAt = sentAt + (duration == null ? 0 : duration.toMillis());
-                    }
-                    captures.add(new AutoChainFinder.Capture(item.id(), itemOrigin, sent.method() + " " + sent.url(),
-                            request, response, sentAt, completedAt));
-                }
-                if (captures.isEmpty()) throw new IOException("Target exceeds the 64 MiB capture limit.");
-                java.util.Collections.reverse(captures);
+                CapturedHistory captured = capturedHistory(target, targetBytes);
+                List<AutoChainFinder.Capture> captures = captured.captures();
                 AutoChainFinder.Plan plan = new AutoChainFinder(captures).find(captures.size() - 1);
                 List<String> warnings = new ArrayList<>(plan.warnings());
-                if (equalTargets > 1) warnings.add("Several identical targets were captured; the latest one was used.");
-                if (limited) warnings.add("Analysis used the most recent 2000 same-origin entries, up to 64 MiB.");
+                warnings.addAll(captured.warnings());
                 warnings.add("Inferred from exact reused data. Server-side state without a reused value, other origins and uncaptured traffic cannot be inferred.");
                 warnings.add("When several prior responses contain a value, the most recent matching response is preferred. Review the proposed steps.");
                 return new AutoChainFinder.Plan(plan.steps(), plan.links(), warnings);

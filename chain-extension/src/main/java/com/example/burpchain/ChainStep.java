@@ -13,6 +13,7 @@ final class ChainStep {
     String requestTemplate;
     byte[] requestBytes;
     java.time.Instant capturedAt;
+    byte[] capturedRequestBytes;
     boolean enabled = true;
     String lastResponse = "";
     byte[] lastResponseBytes = new byte[0];
@@ -23,6 +24,7 @@ final class ChainStep {
         service = item.httpService();
         url = item.request().url();
         setRequest(item.request());
+        capturedRequestBytes = requestBytes.clone();
         capturedAt = item.timingData().map(t -> t.timeRequestSent()).map(t -> t.toInstant()).orElse(null);
         if (item.hasResponse()) {
             lastResponse = item.response().toString();

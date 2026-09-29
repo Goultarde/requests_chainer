@@ -12,12 +12,20 @@ final class AutoChainFinder {
             this(id, origin, label, request, response, id * 10L, id * 10L + 1);
         }
     }
+    record SelectionSource(Capture capture, String selector, String description) {
+        @Override public String toString() {
+            String label = capture.label();
+            return "History #" + capture.id() + " · " + (label.length() > 120 ? label.substring(0, 117) + "..." : label)
+                    + " · " + description;
+        }
+    }
     record Link(int sourceId, int consumerId, String variable, String description) {}
     record PlannedStep(Capture capture, byte[] template, Map<String, String> outputs) {}
     record Plan(List<PlannedStep> steps, List<Link> links, List<String> warnings) {}
     private record Candidate(byte[] value, String selector, String description) {}
     private record Replacement(int start, int end, String variable) {}
     private final List<Capture> history;
+    private int minimumValueLength = 6;
     private final Map<Integer, List<Candidate>> candidates = new LinkedHashMap<>(32, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<Integer, List<Candidate>> entry) { return size() > 32; }
     };
@@ -29,6 +37,31 @@ final class AutoChainFinder {
     private final Set<String> warnings = new LinkedHashSet<>();
 
     AutoChainFinder(List<Capture> history) { this.history = List.copyOf(history); }
+
+    /** Only the explicitly selected bytes are searched. No recursive discovery or other replacements. */
+    List<SelectionSource> findSelectionSources(int targetIndex, int start, int end) throws IOException {
+        if (targetIndex < 0 || targetIndex >= history.size()) throw new IOException("Target not found in captured history");
+        Capture target = history.get(targetIndex);
+        if (start < 0 || end <= start || end > target.request().length)
+            throw new IOException("Select a non-empty byte range in the request");
+        byte[] selected = Arrays.copyOfRange(target.request(), start, end);
+        if (selected.length > 262144) throw new IOException("Selected value exceeds 256 KiB");
+        minimumValueLength = 1;
+        List<SelectionSource> result = new ArrayList<>();
+        for (int i = targetIndex - 1; i >= 0; i--) {
+            if (Thread.currentThread().isInterrupted()) throw new IOException("Analysis cancelled");
+            Capture source = history.get(i);
+            if (!source.origin().equals(target.origin()) || source.response().length == 0
+                    || source.completedAt() > target.sentAt()) continue;
+            for (Candidate candidate : values(source)) {
+                if (Arrays.equals(selected, candidate.value()))
+                    result.add(new SelectionSource(source, candidate.selector(), candidate.description()));
+            }
+        }
+        return List.copyOf(result);
+    }
+
+    List<String> discoveryWarnings() { return List.copyOf(warnings); }
 
     Plan find(int targetIndex) throws IOException {
         if (targetIndex < 0 || targetIndex >= history.size()) throw new IOException("Target not found in captured history");
@@ -135,7 +168,7 @@ final class AutoChainFinder {
         }
     }
     private void add(List<Candidate> out, byte[] value, String kind, String path, String mode, String description, boolean binary) throws IOException {
-        if (value.length < 6 || value.length > 262144) return;
+        if (value.length < minimumValueLength || value.length > 262144) return;
         // Short numbers and ordinary booleans/constants are not persuasive dependencies.
         String text = new String(value, StandardCharsets.UTF_8);
         if (!binary && (text.isBlank() || Set.of("application/json", "text/html", "success", "unknown", "default", "enabled", "disabled").contains(text.toLowerCase(Locale.ROOT)))) return;
@@ -169,11 +202,22 @@ final class AutoChainFinder {
         }
         return result;
     }
-    private static boolean word(byte b) { return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'; }
+    private static boolean word(byte b) { return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_' || b == '-'; }
     private static boolean allowed(String view, int start, int end) {
         int body = view.indexOf("\r\n\r\n"), width = 4;
         if (body < 0) { body = view.indexOf("\n\n"); width = 2; }
-        if (body >= 0 && start >= body + width) return true;
+        if (body >= 0 && start >= body + width) {
+            String headers = view.substring(0, body).toLowerCase(Locale.ROOT);
+            if (headers.contains("application/json") || headers.contains("+json")) {
+                // A response value matching an object key is not a request-value dependency.
+                if (start > 0 && view.charAt(start - 1) == '"' && end < view.length() && view.charAt(end) == '"') {
+                    int next = end + 1;
+                    while (next < view.length() && Character.isWhitespace(view.charAt(next))) next++;
+                    if (next < view.length() && view.charAt(next) == ':') return false;
+                }
+            }
+            return true;
+        }
         int lineStart = view.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
         int lineEnd = view.indexOf('\n', start);
         if (lineEnd >= 0 && end > lineEnd) return false;
