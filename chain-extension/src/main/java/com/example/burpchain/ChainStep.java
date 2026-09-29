@@ -12,8 +12,10 @@ final class ChainStep {
     final String url;
     String requestTemplate;
     byte[] requestBytes;
+    java.time.Instant capturedAt;
     boolean enabled = true;
     String lastResponse = "";
+    byte[] lastResponseBytes = new byte[0];
     String lastResponseBody = "";
     final Map<String, String> outputs = new LinkedHashMap<>();
 
@@ -21,8 +23,10 @@ final class ChainStep {
         service = item.httpService();
         url = item.request().url();
         setRequest(item.request());
+        capturedAt = item.timingData().map(t -> t.timeRequestSent()).map(t -> t.toInstant()).orElse(null);
         if (item.hasResponse()) {
             lastResponse = item.response().toString();
+            lastResponseBytes = item.response().toByteArray().getBytes();
             lastResponseBody = item.response().bodyToString();
         }
     }

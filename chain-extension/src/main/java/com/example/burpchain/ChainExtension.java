@@ -93,6 +93,7 @@ public final class ChainExtension implements BurpExtension {
     private final JTextPane log = new JTextPane();
     private final JLabel status = new JLabel("Select requests in Proxy history, then right-click > Add to Requests Chainer.");
     private volatile boolean running;
+    private boolean findingChain;
     private ChainStep displayedStep;
     private final JComboBox<String> variableBox = new JComboBox<>();
     private final JComboBox<String> chainSelector = new JComboBox<>();
@@ -135,6 +136,9 @@ public final class ChainExtension implements BurpExtension {
         JButton saveChain = new JButton("Save chains");
         JButton loadChain = new JButton("Load chains");
         JButton help = new JButton("Help");
+        JButton automate = new JButton("Automate chain finding");
+        automate.setToolTipText("Build a new chain from preceding responses in same-origin Proxy history");
+        automate.addActionListener(e -> automateChainFinding());
         JButton deleteVariable = new JButton("Delete variable");
         JButton editVariable = new JButton("Edit variable");
         JButton replaceAll = new JButton("Replace in all requests");
@@ -163,7 +167,7 @@ public final class ChainExtension implements BurpExtension {
         Color separator = javax.swing.UIManager.getColor("Separator.foreground");
         top.setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0,
                 separator != null ? separator : Color.GRAY));
-        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain, help));
+        top.add(toolbarRow("CHAIN", new JLabel("Name:"), chainSelector, newChain, saveChain, loadChain, automate, help));
         top.add(toolbarRow("RUN", run, new JLabel("Runs:"), repetitionCount, clear, intruder, repeater, pointRequest, sessionRule));
         top.add(toolbarRow("VARIABLES", new JLabel("Find:"), variableSearch, variableBox, insert, variable, editVariable, deleteVariable));
         top.add(toolbarRow("EDIT", save, replaceAll, propagateHeader));
@@ -653,6 +657,121 @@ public final class ChainExtension implements BurpExtension {
         switchingChain = false;
         status.setText("Chain selected: " + name);
     }
+    private static java.time.Instant captureTime(burp.api.montoya.proxy.ProxyHttpRequestResponse item) {
+        var timing = item.timingData();
+        return timing != null && timing.timeRequestSent() != null
+                ? timing.timeRequestSent().toInstant() : item.time().toInstant();
+    }
+
+    private void automateChainFinding() {
+        if (running || findingChain) { error("Wait for the current operation to finish"); return; }
+        if (table.getSelectedRowCount() != 1) { error("Select exactly one captured target request"); return; }
+        saveSelected();
+        ChainStep target = selectedStep();
+        byte[] targetBytes = target.requestBytes.clone();
+        String origin = target.service.host() + ":" + target.service.port() + ":" + target.service.secure();
+        findingChain = true;
+        status.setText("Finding dependencies in captured Proxy history...");
+        new SwingWorker<AutoChainFinder.Plan, Void>() {
+            @Override protected AutoChainFinder.Plan doInBackground() throws Exception {
+                var history = new ArrayList<>(api.proxy().history());
+                history.sort(java.util.Comparator.comparing(ChainExtension::captureTime)
+                        .thenComparingInt(burp.api.montoya.proxy.ProxyHttpRequestResponse::id));
+                int targetAt = -1;
+                int equalTargets = 0;
+                for (int i = history.size() - 1; i >= 0; i--) {
+                    var item = history.get(i);
+                    var service = item.httpService();
+                    String itemOrigin = service.host() + ":" + service.port() + ":" + service.secure();
+                    HttpRequest sent = item.finalRequest() == null ? item.request() : item.finalRequest();
+                    if (origin.equals(itemOrigin) && java.util.Arrays.equals(targetBytes, sent.toByteArray().getBytes())) {
+                        equalTargets++;
+                        if (targetAt < 0) targetAt = i;
+                        if (target.capturedAt != null && item.timingData() != null
+                                && target.capturedAt.equals(captureTime(item))) {
+                            targetAt = i; equalTargets = 1; break;
+                        }
+                    }
+                }
+                if (targetAt < 0) throw new IOException("Target not found in Proxy history. Add the original captured request before editing it.");
+                List<AutoChainFinder.Capture> captures = new ArrayList<>();
+                long totalBytes = 0;
+                boolean limited = false;
+                for (int i = targetAt; i >= 0; i--) {
+                    var item = history.get(i);
+                    var service = item.httpService();
+                    String itemOrigin = service.host() + ":" + service.port() + ":" + service.secure();
+                    if (!origin.equals(itemOrigin)) continue;
+                    if (!item.hasResponse() && i != targetAt) continue;
+                    HttpRequest sent = item.finalRequest() == null ? item.request() : item.finalRequest();
+                    byte[] request = sent.toByteArray().getBytes();
+                    byte[] response = item.hasResponse() ? item.response().toByteArray().getBytes() : new byte[0];
+                    totalBytes += request.length + response.length;
+                    if (captures.size() >= 2000 || totalBytes > 64L * 1024 * 1024) { limited = true; break; }
+                    long sentAt = captureTime(item).toEpochMilli();
+                    long completedAt = sentAt;
+                    if (item.timingData() != null) {
+                        var duration = item.timingData().timeBetweenRequestSentAndEndOfResponse();
+                        completedAt = sentAt + (duration == null ? 0 : duration.toMillis());
+                    }
+                    captures.add(new AutoChainFinder.Capture(item.id(), itemOrigin, sent.method() + " " + sent.url(),
+                            request, response, sentAt, completedAt));
+                }
+                if (captures.isEmpty()) throw new IOException("Target exceeds the 64 MiB capture limit.");
+                java.util.Collections.reverse(captures);
+                AutoChainFinder.Plan plan = new AutoChainFinder(captures).find(captures.size() - 1);
+                List<String> warnings = new ArrayList<>(plan.warnings());
+                if (equalTargets > 1) warnings.add("Several identical targets were captured; the latest one was used.");
+                if (limited) warnings.add("Analysis used the most recent 2000 same-origin entries, up to 64 MiB.");
+                warnings.add("Inferred from exact reused data. Server-side state without a reused value, other origins and uncaptured traffic cannot be inferred.");
+                warnings.add("When several prior responses contain a value, the most recent matching response is preferred. Review the proposed steps.");
+                return new AutoChainFinder.Plan(plan.steps(), plan.links(), warnings);
+            }
+            @Override protected void done() {
+                findingChain = false;
+                try {
+                    AutoChainFinder.Plan plan = get();
+                    List<ChainStep> generated = new ArrayList<>();
+                    for (var planned : plan.steps()) {
+                        var capture = planned.capture();
+                        HttpRequest original = HttpRequest.httpRequest(target.service, ByteArray.byteArray(capture.request()));
+                        var response = capture.response().length == 0 ? null
+                                : burp.api.montoya.http.message.responses.HttpResponse.httpResponse(ByteArray.byteArray(capture.response()));
+                        ChainStep step = new ChainStep(HttpRequestResponse.httpRequestResponse(original, response));
+                        step.setRequest(HttpRequest.httpRequest(target.service, ByteArray.byteArray(planned.template())));
+                        step.outputs.putAll(planned.outputs());
+                        generated.add(step);
+                    }
+                    storeCurrentChain();
+                    String base = "Auto - " + target.request().method() + " " + target.request().pathWithoutQuery();
+                    String name = base;
+                    for (int n = 2; namedChains.containsKey(name); n++) name = base + " (" + n + ")";
+                    namedChains.put(name, generated);
+                    switchingChain = true;
+                    try {
+                        displayedStep = null;
+                        steps.clear(); steps.addAll(generated);
+                        currentChainName = name;
+                        chainSelector.addItem(name); chainSelector.setSelectedItem(name);
+                        intruderChainEnabled = false; intruderTargetUrl = null;
+                        model.fireTableDataChanged(); refreshVariables();
+                        table.setRowSelectionInterval(steps.size() - 1, steps.size() - 1);
+                        showSelected();
+                    } finally { switchingChain = false; }
+                    appendLog(LogLevel.SUCCESS, "DISCOVERY", "Created " + name + " · " + generated.size() + " step(s), " + plan.links().size() + " dependency link(s)");
+                    for (var link : plan.links()) appendLog(LogLevel.INFO, "DEPENDENCY", "History #" + link.sourceId()
+                            + " → #" + link.consumerId() + " · " + link.variable() + " · " + link.description());
+                    for (String warning : plan.warnings()) appendLog(LogLevel.WARNING, "DISCOVERY", warning);
+                    status.setText("Created " + generated.size() + " steps. Review dependencies in the log, then Run chain.");
+                } catch (Exception ex) {
+                    Throwable cause = ex.getCause() == null ? ex : ex.getCause();
+                    status.setText("Automatic chain finding failed.");
+                    error("Cannot find chain: " + cause.getMessage());
+                }
+            }
+        }.execute();
+    }
+
     private void createNewChain() {
         String name = JOptionPane.showInputDialog(null, "Chain name:", "New chain", JOptionPane.PLAIN_MESSAGE);
         if (name == null || name.isBlank() || namedChains.containsKey(name)) return;
@@ -755,7 +874,9 @@ public final class ChainExtension implements BurpExtension {
         lower.add(regexPanel, BorderLayout.NORTH);
         lower.add(preview, BorderLayout.SOUTH);
         HttpResponseEditor responseSample = api.userInterface().createHttpResponseEditor();
-        responseSample.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(responseText));
+        responseSample.setResponse(step.lastResponseBytes.length == 0
+                ? burp.api.montoya.http.message.responses.HttpResponse.httpResponse(responseText)
+                : burp.api.montoya.http.message.responses.HttpResponse.httpResponse(ByteArray.byteArray(step.lastResponseBytes)));
         final String[] lastSelection = {""};
         Runnable syncSelection = () -> {
             var selection = responseSample.selection().orElse(null);
@@ -830,7 +951,7 @@ public final class ChainExtension implements BurpExtension {
         if (selectedStep() == null) { error("Select a destination request first"); return; }
         String name = (String) variableBox.getSelectedItem();
         if (name == null || name.isBlank()) { error("No variable matches the search"); return; }
-        String replacement = "{{" + name + "}}";
+        String replacement = variablePlaceholder(name);
         byte[] original = requestEditor.getRequest().toByteArray().getBytes();
         byte[] replacementBytes = ByteArray.byteArray(replacement).getBytes();
         byte[] updated;
@@ -888,7 +1009,9 @@ public final class ChainExtension implements BurpExtension {
         displayedStep = step;
         if (step != null) {
             requestEditor.setRequest(step.request());
-            responseEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse(step.lastResponse));
+            responseEditor.setResponse(step.lastResponseBytes.length == 0
+                    ? burp.api.montoya.http.message.responses.HttpResponse.httpResponse(step.lastResponse)
+                    : burp.api.montoya.http.message.responses.HttpResponse.httpResponse(ByteArray.byteArray(step.lastResponseBytes)));
         } else {
             requestEditor.setRequest(HttpRequest.httpRequest());
             responseEditor.setResponse(burp.api.montoya.http.message.responses.HttpResponse.httpResponse());
@@ -955,13 +1078,17 @@ public final class ChainExtension implements BurpExtension {
         java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("(?im)^(" + java.util.regex.Pattern.quote(header.getText()) + "\\s*:\\s*)[^\\r\\n]+$");
         int changed = 0;
         for (ChainStep step : steps) {
-            String updated = pattern.matcher(step.requestTemplate).replaceAll("$1{{" + java.util.regex.Matcher.quoteReplacement(variable) + "}}");
+            String updated = pattern.matcher(step.requestTemplate).replaceAll("$1" + java.util.regex.Matcher.quoteReplacement(variablePlaceholder(variable)));
             if (!updated.equals(step.requestTemplate)) { step.setTemplateText(updated); changed++; }
         }
         displayedStep = null; model.fireTableDataChanged(); showSelected();
         status.setText("Header " + header.getText() + " now uses {{" + variable + "}} in " + changed + " request(s).");
     }
     private String b64(String value) { return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(value.getBytes(StandardCharsets.UTF_8)); }
+    private String variablePlaceholder(String name) {
+        boolean binary = steps.stream().anyMatch(step -> step.outputs.getOrDefault(name, "").startsWith("auto:"));
+        return "{{" + name + (binary ? "|bytes" : "") + "}}";
+    }
     private String unb64(String value) { return new String(java.util.Base64.getUrlDecoder().decode(value), StandardCharsets.UTF_8); }
     private void saveChain() {
         JFileChooser chooser = new JFileChooser();
@@ -1074,7 +1201,7 @@ public final class ChainExtension implements BurpExtension {
     }
 
     private void runChain() {
-        if (running) { error("A chain is already running"); return; }
+        if (running || findingChain) { error("A chain operation is already running"); return; }
         if (steps.isEmpty()) {
             status.setText("Nothing to run: add at least one request from Proxy history.");
             appendLog(LogLevel.WARNING, "CHAIN", "No requests to run");
@@ -1115,9 +1242,10 @@ public final class ChainExtension implements BurpExtension {
                         publish(new LogEntry(httpStatus < 400 ? LogLevel.SUCCESS : LogLevel.ERROR,
                                 "STEP " + (index + 1), "Run " + runNumber + "/" + repetitions
                                 + " · HTTP " + httpStatus + " · " + elapsed + " ms · " + step.url));
+                        step.lastResponseBytes = result.response().toByteArray().getBytes();
                         step.lastResponse = result.response().toString();
                         step.lastResponseBody = result.response().bodyToString();
-                        return new ChainEngine.Response(httpStatus, step.lastResponse);
+                        return new ChainEngine.Response(httpStatus, step.lastResponse, result.response().toByteArray().getBytes());
                     }, message -> {
                         if (message.contains(" = "))
                             publish(new LogEntry(LogLevel.INFO, "VARIABLE", "Run " + runNumber + "/" + repetitions
@@ -1149,7 +1277,7 @@ public final class ChainExtension implements BurpExtension {
     }
 
     private void runWithWordlist() {
-        if (running) { error("A chain is already running"); return; }
+        if (running || findingChain) { error("A chain operation is already running"); return; }
         int target = table.getSelectedRow();
         if (target < 0 || target >= steps.size()) { error("Select the chain request that will receive the wordlist"); return; }
         if (!steps.get(target).enabled) { error("Enable the selected request before using a wordlist"); return; }
@@ -1179,9 +1307,10 @@ public final class ChainExtension implements BurpExtension {
                             ChainStep step = snapshot.get(index);
                             HttpRequestResponse result = api.http().sendRequest(renderedStepRequest(step, raw));
                             if (!result.hasResponse()) return null;
-                            step.lastResponse = result.response().toString();
+                            step.lastResponseBytes = result.response().toByteArray().getBytes();
+                        step.lastResponse = result.response().toString();
                             step.lastResponseBody = result.response().bodyToString();
-                            return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
+                            return new ChainEngine.Response(result.response().statusCode(), step.lastResponse, result.response().toByteArray().getBytes());
                         }, message -> publish("Payload " + runNumber + ": " + message));
                     }
                     return null;
@@ -1288,9 +1417,10 @@ public final class ChainExtension implements BurpExtension {
                     int httpStatus = result.response().statusCode();
                     appendLog(httpStatus < 400 ? LogLevel.SUCCESS : LogLevel.ERROR, "SESSION",
                             "Step " + (index + 1) + " · HTTP " + httpStatus + " · " + elapsed + " ms · " + step.url);
-                    step.lastResponse = result.response().toString();
+                    step.lastResponseBytes = result.response().toByteArray().getBytes();
+                        step.lastResponse = result.response().toString();
                     step.lastResponseBody = result.response().bodyToString();
-                    return new ChainEngine.Response(httpStatus, step.lastResponse);
+                    return new ChainEngine.Response(httpStatus, step.lastResponse, result.response().toByteArray().getBytes());
                 }, message -> {
                     if (message.contains(" = ")) appendLog(LogLevel.INFO, "VARIABLE", "Session · " + message);
                 });
@@ -1327,10 +1457,11 @@ public final class ChainExtension implements BurpExtension {
                     ChainStep step = before.get(index);
                     HttpRequestResponse result = api.http().sendRequest(renderedStepRequest(step, raw, resolvedVariables));
                     if (!result.hasResponse()) return null;
-                    step.lastResponse = result.response().toString();
+                    step.lastResponseBytes = result.response().toByteArray().getBytes();
+                        step.lastResponse = result.response().toString();
                     step.lastResponseBody = result.response().bodyToString();
                     appendLog("Intruder chain step " + (index + 1) + " took " + ((System.nanoTime() - stepStarted) / 1_000_000) + " ms");
-                    return new ChainEngine.Response(result.response().statusCode(), step.lastResponse);
+                    return new ChainEngine.Response(result.response().statusCode(), step.lastResponse, result.response().toByteArray().getBytes());
                 }, message -> appendLog("Intruder chain: " + message));
                 appendLog("Intruder chain preparation took " + ((System.nanoTime() - started) / 1_000_000) + " ms");
                 String targetTemplate = request.toString();

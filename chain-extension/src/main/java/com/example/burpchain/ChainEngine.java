@@ -12,7 +12,9 @@ import java.nio.charset.StandardCharsets;
 /** Runs steps in order; each response contributes variables to later requests. */
 public final class ChainEngine {
     public record Step(String template, Map<String, String> outputs) {}
-    public record Response(int status, String body) {}
+    public record Response(int status, String body, byte[] raw) {
+        public Response(int status, String body) { this(status, body, body.getBytes(StandardCharsets.UTF_8)); }
+    }
     @FunctionalInterface public interface Sender { Response send(int stepIndex, String request) throws Exception; }
     @FunctionalInterface public interface ContextSender {
         Response send(int stepIndex, String request, Map<String, String> variables) throws Exception;
@@ -34,9 +36,12 @@ public final class ChainEngine {
             if (response == null) throw new IOException("Step " + (i + 1) + " returned no response");
             if (response.status() >= 400) throw new IOException("Step " + (i + 1) + " returned HTTP " + response.status());
             for (Map.Entry<String, String> output : step.outputs().entrySet()) {
-                String value = extract(response.body(), output.getValue());
+                boolean automatic = output.getValue().startsWith("auto:");
+                String value = automatic ? Base64.getEncoder().encodeToString(AutoValue.extract(response.raw(), output.getValue()))
+                        : extract(response.body(), output.getValue());
                 variables.put(output.getKey(), value);
-                reporter.report("Step " + (i + 1) + ": " + output.getKey() + " = " + value);
+                reporter.report("Step " + (i + 1) + ": " + output.getKey() + " = "
+                        + (automatic ? "[" + Base64.getDecoder().decode(value).length + " bytes]" : value));
             }
             reporter.report("Step " + (i + 1) + ": HTTP " + response.status());
         }

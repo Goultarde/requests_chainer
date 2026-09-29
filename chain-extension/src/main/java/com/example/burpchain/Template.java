@@ -7,7 +7,7 @@ import java.nio.charset.StandardCharsets;
 
 /** Explicit {{name}} placeholders are substituted in the complete raw request. */
 public final class Template {
-    private static final Pattern VARIABLE = Pattern.compile("\\{\\{([A-Za-z][A-Za-z0-9_]*)}}");
+    private static final Pattern VARIABLE = Pattern.compile("\\{\\{([A-Za-z][A-Za-z0-9_]*)(\\|bytes)?}}");
     private Template() {}
 
     public static String render(String raw, Map<String, String> values) {
@@ -17,6 +17,7 @@ public final class Template {
             String name = matcher.group(1);
             String value = values.get(name);
             if (value == null) throw new IllegalArgumentException("Undefined variable: " + name);
+            if (matcher.group(2) != null) value = new String(java.util.Base64.getDecoder().decode(value), StandardCharsets.ISO_8859_1);
             matcher.appendReplacement(result, Matcher.quoteReplacement(value));
         }
         matcher.appendTail(result);

@@ -9,7 +9,7 @@ import java.util.regex.Pattern;
 
 /** Substitutes ASCII variable markers while preserving every other request byte. */
 final class ByteTemplate {
-    private static final Pattern VARIABLE = Pattern.compile("\\{\\{([A-Za-z][A-Za-z0-9_]*)}}");
+    private static final Pattern VARIABLE = Pattern.compile("\\{\\{([A-Za-z][A-Za-z0-9_]*)(\\|bytes)?}}");
     private static final Pattern LENGTH = Pattern.compile("(?im)^Content-Length:[ \\t]*[0-9]+[ \\t]*$");
     private ByteTemplate() {}
 
@@ -23,7 +23,7 @@ final class ByteTemplate {
             out.write(template, position, marker.start() - position);
             String value = values.get(marker.group(1));
             if (value == null) throw new IllegalArgumentException("Undefined variable: " + marker.group(1));
-            out.writeBytes(encodeValue.apply(value));
+            out.writeBytes(marker.group(2) == null ? encodeValue.apply(value) : java.util.Base64.getDecoder().decode(value));
             position = marker.end();
         } while (marker.find());
         out.write(template, position, template.length - position);
